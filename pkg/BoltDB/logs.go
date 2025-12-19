@@ -6,9 +6,7 @@ package bolt
 import (
 	"encoding/json"
 	"fmt"
-	"time"
 
-	"github.com/oklog/ulid/v2"
 	bolt "go.etcd.io/bbolt"
 )
 
@@ -35,19 +33,6 @@ func DeserializeLogEntry(data []byte) (*LogEntry, error) {
 		return nil, fmt.Errorf("failed to deserialize log entry: %w", err)
 	}
 	return &entry, nil
-}
-
-// GenerateLogID generates a unique log ID (ULID).
-func GenerateLogID() string {
-	entropy := ulid.DefaultEntropy()
-	now := time.Now()
-	id, err := ulid.New(ulid.Timestamp(now), entropy)
-	if err != nil {
-		// This should never happen in practice, but handle it gracefully
-		// Fallback to timestamp-based ID if ULID generation fails
-		return ulid.Make().String()
-	}
-	return id.String()
 }
 
 // GetLogLevelBucketPath returns the bucket path for a specific log level.
@@ -153,7 +138,7 @@ func GetAllLogs(db *DB) ([]*LogEntry, error) {
 	levels := []string{"trace", "debug", "info", "warning", "error", "critical"}
 
 	err := db.View(func(tx *bolt.Tx) error {
-		logsBucket := GetLogsBucket(tx)
+		logsBucket := tx.Bucket([]byte(BucketLogs))
 		if logsBucket == nil {
 			return nil // No logs yet
 		}

@@ -19,7 +19,7 @@ type IteratorOptions struct {
 // The callback receives the ULID (nodeID) for each item in the status bucket.
 func (db *DB) IterateStatusBucket(queueType string, level int, status string, opts IteratorOptions, fn func(nodeID []byte) error) error {
 	return db.View(func(tx *bolt.Tx) error {
-		bucket := GetStatusBucket(tx, queueType, level, status)
+		bucket := getBucket(tx, GetStatusBucketPath(queueType, level, status))
 		if bucket == nil {
 			// Bucket doesn't exist yet, that's okay (no items)
 			return nil
@@ -52,7 +52,7 @@ func (db *DB) IterateStatusBucket(queueType string, level int, status string, op
 // The callback receives the ULID (nodeID) and NodeState for each node.
 func (db *DB) IterateNodeStates(queueType string, opts IteratorOptions, fn func(nodeID []byte, state *NodeState) error) error {
 	return db.View(func(tx *bolt.Tx) error {
-		bucket := GetNodesBucket(tx, queueType)
+		bucket := getBucket(tx, GetNodesBucketPath(queueType))
 		if bucket == nil {
 			return fmt.Errorf("nodes bucket not found for %s", queueType)
 		}
@@ -167,7 +167,7 @@ func (db *DB) countStatusBucketSlow(queueType string, level int, status string) 
 	count := 0
 
 	err := db.View(func(tx *bolt.Tx) error {
-		bucket := GetStatusBucket(tx, queueType, level, status)
+		bucket := getBucket(tx, GetStatusBucketPath(queueType, level, status))
 		if bucket == nil {
 			return nil // Bucket doesn't exist, count is 0
 		}
@@ -204,7 +204,7 @@ func (db *DB) countNodesSlow(queueType string) (int, error) {
 	count := 0
 
 	err := db.View(func(tx *bolt.Tx) error {
-		bucket := GetNodesBucket(tx, queueType)
+		bucket := getBucket(tx, GetNodesBucketPath(queueType))
 		if bucket == nil {
 			return nil
 		}
@@ -283,7 +283,7 @@ func (db *DB) LeaseTasksFromStatus(queueType string, level int, status string, l
 	var nodeIDs [][]byte
 
 	err := db.View(func(tx *bolt.Tx) error {
-		bucket := GetStatusBucket(tx, queueType, level, status)
+		bucket := getBucket(tx, GetStatusBucketPath(queueType, level, status))
 		if bucket == nil {
 			return nil // No items in this status
 		}
@@ -315,12 +315,12 @@ func BatchFetchWithKeys(db *DB, queueType string, level int, status string, limi
 	var results []FetchResult
 
 	err := db.View(func(tx *bolt.Tx) error {
-		statusBucket := GetStatusBucket(tx, queueType, level, status)
+		statusBucket := getBucket(tx, GetStatusBucketPath(queueType, level, status))
 		if statusBucket == nil {
 			return nil // No items in this status
 		}
 
-		nodesBucket := GetNodesBucket(tx, queueType)
+		nodesBucket := getBucket(tx, GetNodesBucketPath(queueType))
 		if nodesBucket == nil {
 			return fmt.Errorf("nodes bucket not found for %s", queueType)
 		}

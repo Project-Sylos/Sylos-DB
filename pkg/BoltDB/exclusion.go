@@ -105,7 +105,7 @@ func HasExclusionHoldingEntries(db *DB, queueType string) (bool, error) {
 	var hasEntries bool
 	err := db.View(func(tx *bolt.Tx) error {
 		// Check exclusion-holding bucket
-		exclusionBucket := GetExclusionHoldingBucket(tx, queueType)
+		exclusionBucket := getBucket(tx, GetExclusionHoldingBucketPath(queueType))
 		if exclusionBucket != nil {
 			cursor := exclusionBucket.Cursor()
 			k, _ := cursor.First()
@@ -116,7 +116,7 @@ func HasExclusionHoldingEntries(db *DB, queueType string) (bool, error) {
 		}
 
 		// Check unexclusion-holding bucket
-		unexclusionBucket := GetUnexclusionHoldingBucket(tx, queueType)
+		unexclusionBucket := getBucket(tx, GetUnexclusionHoldingBucketPath(queueType))
 		if unexclusionBucket != nil {
 			cursor := unexclusionBucket.Cursor()
 			k, _ := cursor.First()
@@ -167,7 +167,7 @@ func CheckHoldingEntry(db *DB, queueType string, nodeID string) (bool, string, e
 
 	err := db.View(func(tx *bolt.Tx) error {
 		// Check exclusion bucket first
-		exclusionBucket := GetExclusionHoldingBucket(tx, queueType)
+		exclusionBucket := getBucket(tx, GetExclusionHoldingBucketPath(queueType))
 		if exclusionBucket != nil && exclusionBucket.Get([]byte(nodeID)) != nil {
 			exists = true
 			mode = "exclude"
@@ -175,7 +175,7 @@ func CheckHoldingEntry(db *DB, queueType string, nodeID string) (bool, string, e
 		}
 
 		// Check unexclusion bucket
-		unexclusionBucket := GetUnexclusionHoldingBucket(tx, queueType)
+		unexclusionBucket := getBucket(tx, GetUnexclusionHoldingBucketPath(queueType))
 		if unexclusionBucket != nil && unexclusionBucket.Get([]byte(nodeID)) != nil {
 			exists = true
 			mode = "unexclude"

@@ -200,7 +200,7 @@ func (db *DB) EnsureStatsBucket() error {
 			return err
 		}
 		// Also ensure queue-stats bucket exists
-		_, err = GetOrCreateQueueStatsBucket(tx)
+		_, err = getOrCreateBucket(tx, GetQueueStatsBucketPath())
 		return err
 	})
 }
@@ -251,7 +251,7 @@ func (db *DB) SyncCounts() error {
 		// Sync nodes buckets
 		for _, queueType := range []string{"SRC", "DST"} {
 			nodesPath := GetNodesBucketPath(queueType)
-			nodesBucket := GetNodesBucket(tx, queueType)
+			nodesBucket := getBucket(tx, nodesPath)
 			if nodesBucket != nil {
 				count := int64(0)
 				cursor := nodesBucket.Cursor()
@@ -272,7 +272,7 @@ func (db *DB) SyncCounts() error {
 		// Sync children buckets
 		for _, queueType := range []string{"SRC", "DST"} {
 			childrenPath := GetChildrenBucketPath(queueType)
-			childrenBucket := GetChildrenBucket(tx, queueType)
+			childrenBucket := getBucket(tx, childrenPath)
 			if childrenBucket != nil {
 				count := int64(0)
 				cursor := childrenBucket.Cursor()
@@ -340,7 +340,7 @@ func (db *DB) SyncCounts() error {
 
 		// Sync LOGS bucket
 		logsPath := GetLogsBucketPath()
-		logsBucket := GetLogsBucket(tx)
+		logsBucket := tx.Bucket([]byte(BucketLogs))
 		if logsBucket != nil {
 			count := int64(0)
 			cursor := logsBucket.Cursor()
@@ -367,7 +367,7 @@ func (db *DB) SyncCounts() error {
 func (db *DB) GetQueueStats(queueKey string) ([]byte, error) {
 	var stats []byte
 	err := db.View(func(tx *bolt.Tx) error {
-		queueStatsBucket := GetQueueStatsBucket(tx)
+		queueStatsBucket := getBucket(tx, GetQueueStatsBucketPath())
 		if queueStatsBucket == nil {
 			return nil // Bucket doesn't exist, return nil stats
 		}
@@ -387,7 +387,7 @@ func (db *DB) GetQueueStats(queueKey string) ([]byte, error) {
 func (db *DB) GetAllQueueStats() (map[string][]byte, error) {
 	allStats := make(map[string][]byte)
 	err := db.View(func(tx *bolt.Tx) error {
-		queueStatsBucket := GetQueueStatsBucket(tx)
+		queueStatsBucket := getBucket(tx, GetQueueStatsBucketPath())
 		if queueStatsBucket == nil {
 			return nil // Bucket doesn't exist, return empty map
 		}

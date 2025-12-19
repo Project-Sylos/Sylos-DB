@@ -205,21 +205,6 @@ func EnsureLevelBucket(tx *bolt.Tx, queueType string, level int) error {
 	return nil
 }
 
-// GetNodesBucket returns the nodes bucket for a queue type.
-func GetNodesBucket(tx *bolt.Tx, queueType string) *bolt.Bucket {
-	return getBucket(tx, GetNodesBucketPath(queueType))
-}
-
-// GetChildrenBucket returns the children bucket for a queue type.
-func GetChildrenBucket(tx *bolt.Tx, queueType string) *bolt.Bucket {
-	return getBucket(tx, GetChildrenBucketPath(queueType))
-}
-
-// GetStatusBucket returns the status bucket for a specific level and status.
-func GetStatusBucket(tx *bolt.Tx, queueType string, level int, status string) *bolt.Bucket {
-	return getBucket(tx, GetStatusBucketPath(queueType, level, status))
-}
-
 // GetOrCreateStatusBucket returns or creates the status bucket for a specific level and status.
 func GetOrCreateStatusBucket(tx *bolt.Tx, queueType string, level int, status string) (*bolt.Bucket, error) {
 	// Ensure the level bucket exists first
@@ -227,27 +212,6 @@ func GetOrCreateStatusBucket(tx *bolt.Tx, queueType string, level int, status st
 		return nil, err
 	}
 	return getOrCreateBucket(tx, GetStatusBucketPath(queueType, level, status))
-}
-
-// GetLogsBucket returns the logs bucket.
-func GetLogsBucket(tx *bolt.Tx) *bolt.Bucket {
-	return tx.Bucket([]byte(BucketLogs))
-}
-
-// GetQueueStatsBucket returns the queue-stats bucket.
-func GetQueueStatsBucket(tx *bolt.Tx) *bolt.Bucket {
-	return getBucket(tx, GetQueueStatsBucketPath())
-}
-
-// GetOrCreateQueueStatsBucket returns or creates the queue-stats bucket.
-func GetOrCreateQueueStatsBucket(tx *bolt.Tx) (*bolt.Bucket, error) {
-	return getOrCreateBucket(tx, GetQueueStatsBucketPath())
-}
-
-// GetStatusLookupBucket returns the status-lookup bucket for a specific level.
-// This bucket stores ULID -> status string mappings.
-func GetStatusLookupBucket(tx *bolt.Tx, queueType string, level int) *bolt.Bucket {
-	return getBucket(tx, GetStatusLookupBucketPath(queueType, level))
 }
 
 // GetOrCreateStatusLookupBucket returns or creates the status-lookup bucket for a specific level.
@@ -271,58 +235,34 @@ func UpdateStatusLookup(tx *bolt.Tx, queueType string, level int, nodeID []byte,
 	return lookupBucket.Put(nodeID, []byte(status))
 }
 
-// GetExclusionHoldingBucket returns the exclusion-holding bucket for a queue type.
-// This bucket stores path hash keys with their depth level as values.
-// Key: path hash (string), Value: depth level (int, stored as bytes)
-func GetExclusionHoldingBucket(tx *bolt.Tx, queueType string) *bolt.Bucket {
-	return getBucket(tx, GetExclusionHoldingBucketPath(queueType))
-}
-
-// GetOrCreateExclusionHoldingBucket returns or creates the exclusion-holding bucket for a queue type.
-// This bucket stores path hash keys with their depth level as values.
-// Key: path hash (string), Value: depth level (int, stored as bytes)
-func GetOrCreateExclusionHoldingBucket(tx *bolt.Tx, queueType string) (*bolt.Bucket, error) {
-	return getOrCreateBucket(tx, GetExclusionHoldingBucketPath(queueType))
-}
-
-// GetUnexclusionHoldingBucket returns the unexclusion-holding bucket for a queue type.
-// This bucket stores path hash keys with their depth level as values.
-// Key: path hash (string), Value: depth level (int, stored as bytes)
-func GetUnexclusionHoldingBucket(tx *bolt.Tx, queueType string) *bolt.Bucket {
-	return getBucket(tx, GetUnexclusionHoldingBucketPath(queueType))
-}
-
-// GetOrCreateUnexclusionHoldingBucket returns or creates the unexclusion-holding bucket for a queue type.
-// This bucket stores path hash keys with their depth level as values.
-// Key: path hash (string), Value: depth level (int, stored as bytes)
-func GetOrCreateUnexclusionHoldingBucket(tx *bolt.Tx, queueType string) (*bolt.Bucket, error) {
-	return getOrCreateBucket(tx, GetUnexclusionHoldingBucketPath(queueType))
-}
-
 // GetHoldingBucket returns the appropriate holding bucket based on mode.
 // mode should be "exclude" or "unexclude"
 func GetHoldingBucket(tx *bolt.Tx, queueType string, mode string) *bolt.Bucket {
+	var path []string
 	switch mode {
 	case "exclude":
-		return GetExclusionHoldingBucket(tx, queueType)
+		path = GetExclusionHoldingBucketPath(queueType)
 	case "unexclude":
-		return GetUnexclusionHoldingBucket(tx, queueType)
+		path = GetUnexclusionHoldingBucketPath(queueType)
 	default:
 		return nil
 	}
+	return getBucket(tx, path)
 }
 
 // GetOrCreateHoldingBucket returns or creates the appropriate holding bucket based on mode.
 // mode should be "exclude" or "unexclude"
 func GetOrCreateHoldingBucket(tx *bolt.Tx, queueType string, mode string) (*bolt.Bucket, error) {
+	var path []string
 	switch mode {
 	case "exclude":
-		return GetOrCreateExclusionHoldingBucket(tx, queueType)
+		path = GetExclusionHoldingBucketPath(queueType)
 	case "unexclude":
-		return GetOrCreateUnexclusionHoldingBucket(tx, queueType)
+		path = GetUnexclusionHoldingBucketPath(queueType)
 	default:
 		return nil, fmt.Errorf("invalid exclusion mode: %s", mode)
 	}
+	return getOrCreateBucket(tx, path)
 }
 
 // GetJoinLookupBucketPath returns the bucket path for the join-lookup bucket.
@@ -332,17 +272,6 @@ func GetJoinLookupBucketPath() []string {
 	return []string{TraversalDataBucket, BucketDst, SubBucketJoinLookup}
 }
 
-// GetJoinLookupBucket returns the join-lookup bucket for DST→SRC node mapping.
-// Returns nil if the bucket doesn't exist.
-func GetJoinLookupBucket(tx *bolt.Tx) *bolt.Bucket {
-	return getBucket(tx, GetJoinLookupBucketPath())
-}
-
-// GetOrCreateJoinLookupBucket returns or creates the join-lookup bucket for DST→SRC node mapping.
-func GetOrCreateJoinLookupBucket(tx *bolt.Tx) (*bolt.Bucket, error) {
-	return getOrCreateBucket(tx, GetJoinLookupBucketPath())
-}
-
 // GetSrcToDstBucketPath returns the bucket path for the src-to-dst lookup bucket.
 // Returns: ["Traversal-Data", "SRC", "src-to-dst"]
 // This bucket maps SRC node ULIDs to corresponding DST node ULIDs (1:1 mapping).
@@ -350,31 +279,9 @@ func GetSrcToDstBucketPath() []string {
 	return []string{TraversalDataBucket, BucketSrc, SubBucketSrcToDst}
 }
 
-// GetSrcToDstBucket returns the src-to-dst lookup bucket for SRC→DST node mapping.
-// Returns nil if the bucket doesn't exist.
-func GetSrcToDstBucket(tx *bolt.Tx) *bolt.Bucket {
-	return getBucket(tx, GetSrcToDstBucketPath())
-}
-
-// GetOrCreateSrcToDstBucket returns or creates the src-to-dst lookup bucket for SRC→DST node mapping.
-func GetOrCreateSrcToDstBucket(tx *bolt.Tx) (*bolt.Bucket, error) {
-	return getOrCreateBucket(tx, GetSrcToDstBucketPath())
-}
-
 // GetDstToSrcBucketPath returns the bucket path for the dst-to-src lookup bucket.
 // Returns: ["Traversal-Data", "DST", "dst-to-src"]
 // This bucket maps DST node ULIDs to corresponding SRC node ULIDs (1:1 mapping).
 func GetDstToSrcBucketPath() []string {
 	return []string{TraversalDataBucket, BucketDst, SubBucketDstToSrc}
-}
-
-// GetDstToSrcBucket returns the dst-to-src lookup bucket for DST→SRC node mapping.
-// Returns nil if the bucket doesn't exist.
-func GetDstToSrcBucket(tx *bolt.Tx) *bolt.Bucket {
-	return getBucket(tx, GetDstToSrcBucketPath())
-}
-
-// GetOrCreateDstToSrcBucket returns or creates the dst-to-src lookup bucket for DST→SRC node mapping.
-func GetOrCreateDstToSrcBucket(tx *bolt.Tx) (*bolt.Bucket, error) {
-	return getOrCreateBucket(tx, GetDstToSrcBucketPath())
 }

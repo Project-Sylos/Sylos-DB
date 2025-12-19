@@ -37,7 +37,7 @@ func InsertNodeWithIndex(db *DB, queueType string, level int, status string, sta
 		}
 
 		// 1. Insert into nodes bucket
-		nodesBucket := GetNodesBucket(tx, queueType)
+		nodesBucket := getBucket(tx, GetNodesBucketPath(queueType))
 		if nodesBucket == nil {
 			return fmt.Errorf("nodes bucket not found for %s", queueType)
 		}
@@ -73,7 +73,7 @@ func InsertNodeWithIndex(db *DB, queueType string, level int, status string, sta
 
 		// 4. Update parent's children list in children bucket
 		if state.ParentID != "" {
-			childrenBucket := GetChildrenBucket(tx, queueType)
+			childrenBucket := getBucket(tx, GetChildrenBucketPath(queueType))
 			if childrenBucket == nil {
 				return fmt.Errorf("children bucket not found for %s", queueType)
 			}
@@ -135,26 +135,26 @@ func DeleteNodeWithIndex(db *DB, queueType string, level int, status string, sta
 		}
 
 		// 1. Delete from nodes bucket
-		nodesBucket := GetNodesBucket(tx, queueType)
+		nodesBucket := getBucket(tx, GetNodesBucketPath(queueType))
 		if nodesBucket != nil {
 			nodesBucket.Delete(nodeID) // Ignore errors
 		}
 
 		// 2. Remove from status bucket
-		statusBucket := GetStatusBucket(tx, queueType, level, status)
+		statusBucket := getBucket(tx, GetStatusBucketPath(queueType, level, status))
 		if statusBucket != nil {
 			statusBucket.Delete(nodeID) // Ignore errors
 		}
 
 		// 3. Remove from status-lookup index
-		lookupBucket := GetStatusLookupBucket(tx, queueType, level)
+		lookupBucket := getBucket(tx, GetStatusLookupBucketPath(queueType, level))
 		if lookupBucket != nil {
 			lookupBucket.Delete(nodeID) // Ignore errors
 		}
 
 		// 4. Remove from parent's children list
 		if state.ParentID != "" {
-			childrenBucket := GetChildrenBucket(tx, queueType)
+			childrenBucket := getBucket(tx, GetChildrenBucketPath(queueType))
 			if childrenBucket != nil {
 				var children []string
 				childrenData := childrenBucket.Get(parentID)
@@ -187,76 +187,96 @@ func DeleteNodeWithIndex(db *DB, queueType string, level int, status string, sta
 	})
 }
 
-// GetChildrenIDsByParentID retrieves the list of child ULIDs for a given parent ULID.
-func GetChildrenIDsByParentID(db *DB, queueType string, parentID string) ([]string, error) {
-	var children []string
-
-	err := db.View(func(tx *bolt.Tx) error {
-		childrenBucket := GetChildrenBucket(tx, queueType)
-		if childrenBucket == nil {
-			return fmt.Errorf("children bucket not found for %s", queueType)
-		}
-
-		childrenData := childrenBucket.Get([]byte(parentID))
-		if childrenData == nil {
-			return nil // No children
-		}
-
-		if err := json.Unmarshal(childrenData, &children); err != nil {
-			return fmt.Errorf("failed to unmarshal children list: %w", err)
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		return nil, err
-	}
-
-	return children, nil
-}
-
-// GetChildrenStatesByParentID retrieves the full NodeState for all children of a parent by parent ULID.
-func GetChildrenStatesByParentID(db *DB, queueType string, parentID string) ([]*NodeState, error) {
-	childIDs, err := GetChildrenIDsByParentID(db, queueType, parentID)
-	if err != nil {
-		return nil, err
-	}
-
-	if len(childIDs) == 0 {
-		return []*NodeState{}, nil
-	}
-
-	var children []*NodeState
-
-	err = db.View(func(tx *bolt.Tx) error {
-		nodesBucket := GetNodesBucket(tx, queueType)
-		if nodesBucket == nil {
-			return fmt.Errorf("nodes bucket not found for %s", queueType)
-		}
-
-		for _, childID := range childIDs {
-			nodeData := nodesBucket.Get([]byte(childID))
-			if nodeData == nil {
-				continue // Child may have been deleted
+// GetChildrenByParentID retrieves children of a parent by parent ULID.
+// returnType is either "ids" (returns []string of ULIDs) or "states" (returns []*NodeState).
+// This avoids two transactions by doing everything in one View transaction.
+func GetChildrenByParentID(db *DB, queueType string, parentID string, returnType string) (interface{}, error) {
+	switch returnType {
+	case "ids":
+		var childIDs []string
+		err := db.View(func(tx *bolt.Tx) error {
+			childrenBucket := getBucket(tx, GetChildrenBucketPath(queueType))
+			if childrenBucket == nil {
+				return fmt.Errorf("children bucket not found for %s", queueType)
 			}
 
-			ns, err := DeserializeNodeState(nodeData)
-			if err != nil {
-				return fmt.Errorf("failed to deserialize child node: %w", err)
+			childrenData := childrenBucket.Get([]byte(parentID))
+			if childrenData == nil {
+				return nil // No children
 			}
 
-			children = append(children, ns)
+			if err := json.Unmarshal(childrenData, &childIDs); err != nil {
+				return fmt.Errorf("failed to unmarshal children list: %w", err)
+			}
+
+			return nil
+		})
+
+		if err != nil {
+			return nil, err
 		}
 
-		return nil
-	})
+		if childIDs == nil {
+			return []string{}, nil
+		}
+		return childIDs, nil
 
-	if err != nil {
-		return nil, err
+	case "states":
+		var children []*NodeState
+		err := db.View(func(tx *bolt.Tx) error {
+			childrenBucket := getBucket(tx, GetChildrenBucketPath(queueType))
+			if childrenBucket == nil {
+				return fmt.Errorf("children bucket not found for %s", queueType)
+			}
+
+			childrenData := childrenBucket.Get([]byte(parentID))
+			if childrenData == nil {
+				return nil // No children
+			}
+
+			var childIDs []string
+			if err := json.Unmarshal(childrenData, &childIDs); err != nil {
+				return fmt.Errorf("failed to unmarshal children list: %w", err)
+			}
+
+			if len(childIDs) == 0 {
+				return nil
+			}
+
+			nodesBucket := getBucket(tx, GetNodesBucketPath(queueType))
+			if nodesBucket == nil {
+				return fmt.Errorf("nodes bucket not found for %s", queueType)
+			}
+
+			for _, childID := range childIDs {
+				nodeData := nodesBucket.Get([]byte(childID))
+				if nodeData == nil {
+					continue // Child may have been deleted
+				}
+
+				ns, err := DeserializeNodeState(nodeData)
+				if err != nil {
+					return fmt.Errorf("failed to deserialize child node: %w", err)
+				}
+
+				children = append(children, ns)
+			}
+
+			return nil
+		})
+
+		if err != nil {
+			return nil, err
+		}
+
+		if children == nil {
+			return []*NodeState{}, nil
+		}
+		return children, nil
+
+	default:
+		return nil, fmt.Errorf("invalid returnType: %s (must be 'ids' or 'states')", returnType)
 	}
-
-	return children, nil
 }
 
 // computeBatchInsertStatsDeltas analyzes insert operations and computes stats deltas.
@@ -284,13 +304,13 @@ func computeBatchInsertStatsDeltas(tx *bolt.Tx, ops []InsertOperation) map[strin
 		}
 
 		// Check if node already exists - only count new nodes
-		nodesBucket := GetNodesBucket(tx, op.QueueType)
+		nodesBucket := getBucket(tx, GetNodesBucketPath(op.QueueType))
 		if nodesBucket != nil && nodesBucket.Get(nodeID) == nil {
 			nodesCounts[op.QueueType]++
 		}
 
 		// Check if status entry already exists - only count new entries
-		statusBucket := GetStatusBucket(tx, op.QueueType, op.Level, op.Status)
+		statusBucket := getBucket(tx, GetStatusBucketPath(op.QueueType, op.Level, op.Status))
 		if statusBucket == nil || statusBucket.Get(nodeID) == nil {
 			statusKey := fmt.Sprintf("%s/%d/%s", op.QueueType, op.Level, op.Status)
 			statusCounts[statusKey]++
@@ -298,7 +318,7 @@ func computeBatchInsertStatsDeltas(tx *bolt.Tx, ops []InsertOperation) map[strin
 
 		// Check if children entry needs to be created
 		if op.State.ParentID != "" {
-			childrenBucket := GetChildrenBucket(tx, op.QueueType)
+			childrenBucket := getBucket(tx, GetChildrenBucketPath(op.QueueType))
 			if childrenBucket != nil && childrenBucket.Get(parentID) == nil {
 				childrenCounts[op.QueueType]++
 			}
@@ -365,7 +385,7 @@ func BatchInsertNodes(db *DB, ops []InsertOperation) error {
 
 			// Get or cache nodes bucket
 			if currentQueueType != op.QueueType {
-				nodesBucket = GetNodesBucket(tx, op.QueueType)
+				nodesBucket = getBucket(tx, GetNodesBucketPath(op.QueueType))
 				if nodesBucket == nil {
 					return fmt.Errorf("nodes bucket not found for %s", op.QueueType)
 				}
@@ -403,7 +423,7 @@ func BatchInsertNodes(db *DB, ops []InsertOperation) error {
 
 			// 4. Update children index
 			if op.State.ParentID != "" {
-				childrenBucket := GetChildrenBucket(tx, op.QueueType)
+				childrenBucket := getBucket(tx, GetChildrenBucketPath(op.QueueType))
 				if childrenBucket == nil {
 					return fmt.Errorf("children bucket not found for %s", op.QueueType)
 				}
@@ -433,12 +453,12 @@ func BatchInsertNodes(db *DB, ops []InsertOperation) error {
 			// For DST nodes, store DST→SRC and SRC→DST mappings
 			if op.QueueType == "DST" && op.State.SrcID != "" {
 				// Store DST→SRC mapping
-				dstToSrcBucket, err := GetOrCreateDstToSrcBucket(tx)
+				dstToSrcBucket, err := getOrCreateBucket(tx, GetDstToSrcBucketPath())
 				if err == nil {
 					dstToSrcBucket.Put(nodeID, []byte(op.State.SrcID))
 				}
 				// Store SRC→DST mapping
-				srcToDstBucket, err := GetOrCreateSrcToDstBucket(tx)
+				srcToDstBucket, err := getOrCreateBucket(tx, GetSrcToDstBucketPath())
 				if err == nil {
 					srcToDstBucket.Put([]byte(op.State.SrcID), nodeID)
 				}
@@ -467,12 +487,12 @@ func BatchDeleteNodes(db *DB, queueType string, nodeIDs []string) error {
 	}
 
 	return db.Update(func(tx *bolt.Tx) error {
-		nodesBucket := GetNodesBucket(tx, queueType)
+		nodesBucket := getBucket(tx, GetNodesBucketPath(queueType))
 		if nodesBucket == nil {
 			return fmt.Errorf("nodes bucket not found for %s", queueType)
 		}
 
-		childrenBucket := GetChildrenBucket(tx, queueType)
+		childrenBucket := getBucket(tx, GetChildrenBucketPath(queueType))
 		if childrenBucket == nil {
 			return fmt.Errorf("children bucket not found for %s", queueType)
 		}
@@ -481,9 +501,9 @@ func BatchDeleteNodes(db *DB, queueType string, nodeIDs []string) error {
 		var srcToDstBucket, dstToSrcBucket *bolt.Bucket
 		switch queueType {
 		case "SRC":
-			srcToDstBucket = GetSrcToDstBucket(tx)
+			srcToDstBucket = getBucket(tx, GetSrcToDstBucketPath())
 		case "DST":
-			dstToSrcBucket = GetDstToSrcBucket(tx)
+			dstToSrcBucket = getBucket(tx, GetDstToSrcBucketPath())
 		}
 
 		// Track parent updates and stats deltas
@@ -505,7 +525,7 @@ func BatchDeleteNodes(db *DB, queueType string, nodeIDs []string) error {
 			}
 
 			// Determine current status from status-lookup
-			lookupBucket := GetStatusLookupBucket(tx, queueType, ns.Depth)
+			lookupBucket := getBucket(tx, GetStatusLookupBucketPath(queueType, ns.Depth))
 			var currentStatus string
 			if lookupBucket != nil {
 				statusData := lookupBucket.Get(nodeID)
@@ -524,7 +544,7 @@ func BatchDeleteNodes(db *DB, queueType string, nodeIDs []string) error {
 
 			// 2. Delete from status bucket
 			if currentStatus != "" {
-				statusBucket := GetStatusBucket(tx, queueType, ns.Depth, currentStatus)
+				statusBucket := getBucket(tx, GetStatusBucketPath(queueType, ns.Depth, currentStatus))
 				if statusBucket != nil {
 					statusBucket.Delete(nodeID) // Ignore errors
 					// Decrement status bucket count
@@ -620,7 +640,7 @@ func BatchDeleteNodes(db *DB, queueType string, nodeIDs []string) error {
 // This is the preferred method - use ULID directly instead of path lookup.
 func UpdateNodeStatusInTxByID(tx *bolt.Tx, queueType string, level int, oldStatus, newStatus string, nodeID []byte) error {
 	// Get the node data from nodes bucket
-	nodesBucket := GetNodesBucket(tx, queueType)
+	nodesBucket := getBucket(tx, GetNodesBucketPath(queueType))
 	if nodesBucket == nil {
 		return fmt.Errorf("nodes bucket not found for %s", queueType)
 	}
@@ -649,7 +669,7 @@ func UpdateNodeStatusInTxByID(tx *bolt.Tx, queueType string, level int, oldStatu
 
 	// Update status bucket membership
 	// Delete from old status bucket
-	oldBucket := GetStatusBucket(tx, queueType, level, oldStatus)
+	oldBucket := getBucket(tx, GetStatusBucketPath(queueType, level, oldStatus))
 	if oldBucket != nil {
 		if err := oldBucket.Delete(nodeID); err != nil {
 			return fmt.Errorf("failed to delete from old status bucket: %w", err)
@@ -702,7 +722,7 @@ func BatchInsertNodesInTx(tx *bolt.Tx, operations []InsertOperation) error {
 
 		// Get or cache nodes bucket
 		if currentQueueType != op.QueueType {
-			nodesBucket = GetNodesBucket(tx, op.QueueType)
+			nodesBucket = getBucket(tx, GetNodesBucketPath(op.QueueType))
 			if nodesBucket == nil {
 				return fmt.Errorf("nodes bucket not found for %s", op.QueueType)
 			}
@@ -736,7 +756,7 @@ func BatchInsertNodesInTx(tx *bolt.Tx, operations []InsertOperation) error {
 
 		// 4. Update children index
 		if op.State.ParentID != "" {
-			childrenBucket := GetChildrenBucket(tx, op.QueueType)
+			childrenBucket := getBucket(tx, GetChildrenBucketPath(op.QueueType))
 			if childrenBucket == nil {
 				return fmt.Errorf("children bucket not found for %s", op.QueueType)
 			}
@@ -778,17 +798,27 @@ func BatchInsertNodesInTx(tx *bolt.Tx, operations []InsertOperation) error {
 	return nil
 }
 
-// UpdateNodeStatusByID updates a node's traversal status by moving it between status buckets using ULID.
-// The node data remains in the nodes bucket; only the status membership changes.
+// UpdateNodeByID updates a node in one transaction, either for traversal status or copy status, depending on updateType.
+// updateType is either "status" (for traversal status) or "copy" (for copy status).
+// For updateType "status": oldValue is oldStatus, newValue is newStatus, level is required.
+// For updateType "copy": oldValue is unused (can be ""), newValue is newCopyStatus, level is unused (can be 0).
 // Returns the updated NodeState.
-func UpdateNodeStatusByID(db *DB, queueType string, level int, oldStatus, newStatus string, nodeID string) (*NodeState, error) {
+func UpdateNodeByID(
+	db *DB,
+	queueType string,
+	level int,
+	updateType string, // "status" or "copy"
+	oldValue string, // if "status", this is oldStatus; ignored for "copy"
+	newValue string, // if "status", this is newStatus; if "copy", this is newCopyStatus
+	nodeID string,
+) (*NodeState, error) {
 	var nodeState *NodeState
 
 	err := db.Update(func(tx *bolt.Tx) error {
 		nodeIDBytes := []byte(nodeID)
 
 		// Get the node data from nodes bucket
-		nodesBucket := GetNodesBucket(tx, queueType)
+		nodesBucket := getBucket(tx, GetNodesBucketPath(queueType))
 		if nodesBucket == nil {
 			return fmt.Errorf("nodes bucket not found for %s", queueType)
 		}
@@ -798,97 +828,53 @@ func UpdateNodeStatusByID(db *DB, queueType string, level int, oldStatus, newSta
 			return fmt.Errorf("node not found in nodes bucket: %s", nodeID)
 		}
 
-		// Deserialize and update traversal status
+		// Deserialize node state
 		ns, err := DeserializeNodeState(nodeData)
 		if err != nil {
 			return fmt.Errorf("failed to deserialize node state: %w", err)
 		}
-		ns.TraversalStatus = newStatus
 
-		// Serialize updated state back to nodes bucket
-		updatedData, err := ns.Serialize()
-		if err != nil {
-			return fmt.Errorf("failed to serialize node state: %w", err)
-		}
-
-		if err := nodesBucket.Put(nodeIDBytes, updatedData); err != nil {
-			return fmt.Errorf("failed to update node in nodes bucket: %w", err)
-		}
-
-		nodeState = ns
-
-		// Update status bucket membership
-		// Delete from old status bucket
-		oldBucket := GetStatusBucket(tx, queueType, level, oldStatus)
-		if oldBucket != nil {
-			if err := oldBucket.Delete(nodeIDBytes); err != nil {
-				return fmt.Errorf("failed to delete from old status bucket: %w", err)
+		switch updateType {
+		case "status":
+			// Use the TX-level function to avoid duplication
+			if err := UpdateNodeStatusInTxByID(tx, queueType, level, oldValue, newValue, nodeIDBytes); err != nil {
+				return err
 			}
+
+			// Get the updated node state to return
+			updatedNodeData := nodesBucket.Get(nodeIDBytes)
+			if updatedNodeData == nil {
+				return fmt.Errorf("node not found after update: %s", nodeID)
+			}
+
+			ns, err := DeserializeNodeState(updatedNodeData)
+			if err != nil {
+				return fmt.Errorf("failed to deserialize updated node state: %w", err)
+			}
+
+			nodeState = ns
+
+		case "copy":
+			// Update copy status and copy_needed flag
+			ns.CopyStatus = newValue
+			ns.CopyNeeded = (newValue == CopyStatusPending)
+
+			// Serialize and save
+			updatedData, err := ns.Serialize()
+			if err != nil {
+				return fmt.Errorf("failed to serialize node state: %w", err)
+			}
+
+			if err := nodesBucket.Put(nodeIDBytes, updatedData); err != nil {
+				return fmt.Errorf("failed to update node: %w", err)
+			}
+
+			nodeState = ns
+
+		default:
+			return fmt.Errorf("unknown updateType: %s", updateType)
 		}
 
-		// Add to new status bucket
-		newBucket, err := GetOrCreateStatusBucket(tx, queueType, level, newStatus)
-		if err != nil {
-			return fmt.Errorf("failed to get new status bucket: %w", err)
-		}
-
-		if err := newBucket.Put(nodeIDBytes, []byte{}); err != nil {
-			return fmt.Errorf("failed to add to new status bucket: %w", err)
-		}
-
-		// Update status-lookup index
-		if err := UpdateStatusLookup(tx, queueType, level, nodeIDBytes, newStatus); err != nil {
-			return fmt.Errorf("failed to update status-lookup: %w", err)
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		return nil, err
-	}
-
-	return nodeState, nil
-}
-
-// UpdateNodeCopyStatusByID updates a node's copy status in the metadata (in nodes bucket) using ULID.
-// This only updates the CopyStatus field in NodeState without changing status bucket membership.
-func UpdateNodeCopyStatusByID(db *DB, queueType string, level int, status string, nodeID string, newCopyStatus string) (*NodeState, error) {
-	var nodeState *NodeState
-
-	err := db.Update(func(tx *bolt.Tx) error {
-		nodeIDBytes := []byte(nodeID)
-
-		nodesBucket := GetNodesBucket(tx, queueType)
-		if nodesBucket == nil {
-			return fmt.Errorf("nodes bucket not found for %s", queueType)
-		}
-
-		nodeData := nodesBucket.Get(nodeIDBytes)
-		if nodeData == nil {
-			return fmt.Errorf("node not found: %s", nodeID)
-		}
-
-		ns, err := DeserializeNodeState(nodeData)
-		if err != nil {
-			return fmt.Errorf("failed to deserialize node state: %w", err)
-		}
-
-		// Update copy status and copy_needed flag
-		ns.CopyStatus = newCopyStatus
-		ns.CopyNeeded = (newCopyStatus == CopyStatusPending)
-
-		// Serialize and save
-		updatedData, err := ns.Serialize()
-		if err != nil {
-			return fmt.Errorf("failed to serialize node state: %w", err)
-		}
-
-		if err := nodesBucket.Put(nodeIDBytes, updatedData); err != nil {
-			return fmt.Errorf("failed to update node: %w", err)
-		}
-
-		nodeState = ns
 		return nil
 	})
 
@@ -917,7 +903,7 @@ func SetNodeState(db *DB, queueType string, nodeID []byte, state *NodeState) err
 	}
 
 	return db.Update(func(tx *bolt.Tx) error {
-		nodesBucket := GetNodesBucket(tx, queueType)
+		nodesBucket := getBucket(tx, GetNodesBucketPath(queueType))
 		if nodesBucket == nil {
 			return fmt.Errorf("nodes bucket not found for %s", queueType)
 		}
@@ -930,7 +916,7 @@ func GetNodeState(db *DB, queueType string, nodeID string) (*NodeState, error) {
 	var nodeState *NodeState
 
 	err := db.View(func(tx *bolt.Tx) error {
-		nodesBucket := GetNodesBucket(tx, queueType)
+		nodesBucket := getBucket(tx, GetNodesBucketPath(queueType))
 		if nodesBucket == nil {
 			return fmt.Errorf("nodes bucket not found for %s", queueType)
 		}
@@ -956,85 +942,39 @@ func GetNodeState(db *DB, queueType string, nodeID string) (*NodeState, error) {
 	return nodeState, nil
 }
 
-// BatchUpdateNodeStatusByID updates multiple nodes from one status to another in a single transaction using ULIDs.
-func BatchUpdateNodeStatusByID(db *DB, queueType string, level int, oldStatus, newStatus string, nodeIDs []string) (map[string]*NodeState, error) {
+// BatchUpdateNodesByID updates multiple nodes in one transaction, either for traversal status or copy status, depending on updateType.
+// updateType is either "status" (for traversal status) or "copy" (for copy status).
+// For updateType "status": oldValue is oldStatus, newValue is newStatus.
+// For updateType "copy": oldValue is unused (can be ""), newValue is newCopyStatus.
+func BatchUpdateNodesByID(
+	db *DB,
+	queueType string,
+	level int,
+	updateType string, // "status" or "copy"
+	oldValue string, // if "status", this is oldStatus; ignored for "copy"
+	newValue string, // if "status", this is newStatus; if "copy", this is newCopyStatus
+	nodeIDs []string,
+) (map[string]*NodeState, error) {
 	results := make(map[string]*NodeState)
 
 	err := db.Update(func(tx *bolt.Tx) error {
-		nodesBucket := GetNodesBucket(tx, queueType)
+		nodesBucket := getBucket(tx, GetNodesBucketPath(queueType))
 		if nodesBucket == nil {
 			return fmt.Errorf("nodes bucket not found for %s", queueType)
 		}
 
-		oldBucket := GetStatusBucket(tx, queueType, level, oldStatus)
-		newBucket, err := GetOrCreateStatusBucket(tx, queueType, level, newStatus)
-		if err != nil {
-			return fmt.Errorf("failed to get new status bucket: %w", err)
+		var oldBucket, newStatusBucket *bolt.Bucket
+		var err error
+		if updateType == "status" {
+			oldBucket = getBucket(tx, GetStatusBucketPath(queueType, level, oldValue))
+			newStatusBucket, err = GetOrCreateStatusBucket(tx, queueType, level, newValue)
+			if err != nil {
+				return fmt.Errorf("failed to get new status bucket: %w", err)
+			}
 		}
 
 		for _, nodeIDStr := range nodeIDs {
 			nodeID := []byte(nodeIDStr)
-
-			// Get node data
-			nodeData := nodesBucket.Get(nodeID)
-			if nodeData == nil {
-				// Skip if not found (may have been processed by another worker)
-				continue
-			}
-
-			// Deserialize and update
-			ns, err := DeserializeNodeState(nodeData)
-			if err != nil {
-				return fmt.Errorf("failed to deserialize node state: %w", err)
-			}
-			ns.TraversalStatus = newStatus
-
-			// Serialize and save
-			updatedData, err := ns.Serialize()
-			if err != nil {
-				return fmt.Errorf("failed to serialize node state: %w", err)
-			}
-
-			if err := nodesBucket.Put(nodeID, updatedData); err != nil {
-				return fmt.Errorf("failed to update node: %w", err)
-			}
-
-			// Update status bucket membership
-			if oldBucket != nil {
-				oldBucket.Delete(nodeID) // Ignore errors
-			}
-
-			if err := newBucket.Put(nodeID, []byte{}); err != nil {
-				return fmt.Errorf("failed to add to new status bucket: %w", err)
-			}
-
-			// Update status-lookup index
-			if err := UpdateStatusLookup(tx, queueType, level, nodeID, newStatus); err != nil {
-				return fmt.Errorf("failed to update status-lookup: %w", err)
-			}
-
-			results[nodeIDStr] = ns
-		}
-
-		return nil
-	})
-
-	return results, err
-}
-
-// BatchUpdateNodeCopyStatusByID updates copy status for multiple nodes in one transaction using ULIDs.
-func BatchUpdateNodeCopyStatusByID(db *DB, queueType string, level int, status string, newCopyStatus string, nodeIDs []string) (map[string]*NodeState, error) {
-	results := make(map[string]*NodeState)
-
-	err := db.Update(func(tx *bolt.Tx) error {
-		nodesBucket := GetNodesBucket(tx, queueType)
-		if nodesBucket == nil {
-			return fmt.Errorf("nodes bucket not found for %s", queueType)
-		}
-
-		for _, nodeIDStr := range nodeIDs {
-			nodeID := []byte(nodeIDStr)
-
 			nodeData := nodesBucket.Get(nodeID)
 			if nodeData == nil {
 				continue
@@ -1045,21 +985,53 @@ func BatchUpdateNodeCopyStatusByID(db *DB, queueType string, level int, status s
 				return fmt.Errorf("failed to deserialize node state: %w", err)
 			}
 
-			ns.CopyStatus = newCopyStatus
-			ns.CopyNeeded = (newCopyStatus == CopyStatusPending)
+			switch updateType {
+			case "status":
+				// Update traversal status
+				ns.TraversalStatus = newValue
 
-			updatedData, err := ns.Serialize()
-			if err != nil {
-				return fmt.Errorf("failed to serialize node state: %w", err)
+				updatedData, err := ns.Serialize()
+				if err != nil {
+					return fmt.Errorf("failed to serialize node state: %w", err)
+				}
+
+				if err := nodesBucket.Put(nodeID, updatedData); err != nil {
+					return fmt.Errorf("failed to update node: %w", err)
+				}
+
+				// Update status bucket membership
+				if oldBucket != nil {
+					oldBucket.Delete(nodeID) // Ignore errors
+				}
+				if err := newStatusBucket.Put(nodeID, []byte{}); err != nil {
+					return fmt.Errorf("failed to add to new status bucket: %w", err)
+				}
+
+				// Update status-lookup index
+				if err := UpdateStatusLookup(tx, queueType, level, nodeID, newValue); err != nil {
+					return fmt.Errorf("failed to update status-lookup: %w", err)
+				}
+				results[nodeIDStr] = ns
+
+			case "copy":
+				// Update copy status
+				ns.CopyStatus = newValue
+				ns.CopyNeeded = (newValue == CopyStatusPending)
+
+				updatedData, err := ns.Serialize()
+				if err != nil {
+					return fmt.Errorf("failed to serialize node state: %w", err)
+				}
+
+				if err := nodesBucket.Put(nodeID, updatedData); err != nil {
+					return fmt.Errorf("failed to update node: %w", err)
+				}
+				results[nodeIDStr] = ns
+
+			default:
+				return fmt.Errorf("unknown updateType: %s", updateType)
 			}
-
-			if err := nodesBucket.Put(nodeID, updatedData); err != nil {
-				return fmt.Errorf("failed to update node: %w", err)
-			}
-
-			results[nodeIDStr] = ns
 		}
-
 		return nil
 	})
 
