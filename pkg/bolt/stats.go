@@ -361,6 +361,39 @@ func (db *DB) SyncCounts() error {
 	})
 }
 
+// SetQueueStats writes queue statistics to the queue-stats bucket.
+// queueKey is the key for the stats (e.g., "src-traversal", "dst-traversal").
+// statsJSON is the JSON-encoded stats data to store.
+func (db *DB) SetQueueStats(queueKey string, statsJSON []byte) error {
+	return db.Update(func(tx *bolt.Tx) error {
+		queueStatsBucket, err := getOrCreateBucket(tx, GetQueueStatsBucketPath())
+		if err != nil {
+			return fmt.Errorf("failed to get queue-stats bucket: %w", err)
+		}
+
+		return queueStatsBucket.Put([]byte(queueKey), statsJSON)
+	})
+}
+
+// SetQueueStatsBatch writes multiple queue statistics in a single transaction.
+// statsMap is a map of queue key -> JSON-encoded stats.
+func (db *DB) SetQueueStatsBatch(statsMap map[string][]byte) error {
+	return db.Update(func(tx *bolt.Tx) error {
+		queueStatsBucket, err := getOrCreateBucket(tx, GetQueueStatsBucketPath())
+		if err != nil {
+			return fmt.Errorf("failed to get queue-stats bucket: %w", err)
+		}
+
+		for queueKey, statsJSON := range statsMap {
+			if err := queueStatsBucket.Put([]byte(queueKey), statsJSON); err != nil {
+				return fmt.Errorf("failed to write stats for %s: %w", queueKey, err)
+			}
+		}
+
+		return nil
+	})
+}
+
 // GetQueueStats retrieves queue statistics from the queue-stats bucket.
 // Returns the JSON-encoded stats for the specified queue key (e.g., "src-traversal", "dst-traversal").
 // Returns nil if the stats don't exist.
