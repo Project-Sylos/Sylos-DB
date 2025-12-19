@@ -6,14 +6,15 @@ package bolt
 import (
 	"encoding/json"
 	"fmt"
+	"time"
 
-	"github.com/google/uuid"
+	"github.com/oklog/ulid/v2"
 	bolt "go.etcd.io/bbolt"
 )
 
 // LogEntry represents a single log entry stored in BoltDB.
 type LogEntry struct {
-	ID        string `json:"id"`        // UUID
+	ID        string `json:"id"`        // ULID
 	Timestamp string `json:"timestamp"` // RFC3339Nano format
 	Level     string `json:"level"`     // "trace", "debug", "info", "warning", "error", "critical"
 	Entity    string `json:"entity"`    // "worker", "queue", "coordinator", etc.
@@ -36,9 +37,17 @@ func DeserializeLogEntry(data []byte) (*LogEntry, error) {
 	return &entry, nil
 }
 
-// GenerateLogID generates a unique log ID (UUID v4).
+// GenerateLogID generates a unique log ID (ULID).
 func GenerateLogID() string {
-	return uuid.New().String()
+	entropy := ulid.DefaultEntropy()
+	now := time.Now()
+	id, err := ulid.New(ulid.Timestamp(now), entropy)
+	if err != nil {
+		// This should never happen in practice, but handle it gracefully
+		// Fallback to timestamp-based ID if ULID generation fails
+		return ulid.Make().String()
+	}
+	return id.String()
 }
 
 // GetLogLevelBucketPath returns the bucket path for a specific log level.
