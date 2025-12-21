@@ -317,7 +317,7 @@ func (db *DB) ValidateCoreSchema() error {
 				}
 
 				// Required status buckets for all queues
-				requiredStatuses := []string{StatusPending, StatusSuccessful, StatusFailed}
+				requiredStatuses := []string{StatusPending, StatusInProgress, StatusSuccessful, StatusFailed}
 				if queueType == BucketDst {
 					// DST also needs not_on_src
 					requiredStatuses = append(requiredStatuses, StatusNotOnSrc)

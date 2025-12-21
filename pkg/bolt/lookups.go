@@ -162,11 +162,11 @@ func BatchGetULIDsFromPathsOrHashes(db *DB, queueType string, pathsOrHashes []st
 	return results, err
 }
 
-// SetJoinMapping stores a node mapping in the lookup table.
+// SetJoinMappingInTx stores a node mapping in the lookup table within an existing transaction.
 // direction is either "src-to-dst" or "dst-to-src".
 // For "src-to-dst": fromID is SRC node ULID, toID is DST node ULID.
 // For "dst-to-src": fromID is DST node ULID, toID is SRC node ULID.
-func SetJoinMapping(db *DB, direction string, fromID, toID string) error {
+func SetJoinMappingInTx(tx *bolt.Tx, direction string, fromID, toID string) error {
 	var bucketPath []string
 	switch direction {
 	case "src-to-dst":
@@ -177,12 +177,20 @@ func SetJoinMapping(db *DB, direction string, fromID, toID string) error {
 		return fmt.Errorf("invalid direction: %s (must be 'src-to-dst' or 'dst-to-src')", direction)
 	}
 
+	bucket, err := getOrCreateBucket(tx, bucketPath)
+	if err != nil {
+		return fmt.Errorf("failed to get join mapping bucket: %w", err)
+	}
+	return bucket.Put([]byte(fromID), []byte(toID))
+}
+
+// SetJoinMapping stores a node mapping in the lookup table.
+// direction is either "src-to-dst" or "dst-to-src".
+// For "src-to-dst": fromID is SRC node ULID, toID is DST node ULID.
+// For "dst-to-src": fromID is DST node ULID, toID is SRC node ULID.
+func SetJoinMapping(db *DB, direction string, fromID, toID string) error {
 	return db.Update(func(tx *bolt.Tx) error {
-		bucket, err := getOrCreateBucket(tx, bucketPath)
-		if err != nil {
-			return fmt.Errorf("failed to get join mapping bucket: %w", err)
-		}
-		return bucket.Put([]byte(fromID), []byte(toID))
+		return SetJoinMappingInTx(tx, direction, fromID, toID)
 	})
 }
 

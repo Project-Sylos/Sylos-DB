@@ -5,6 +5,7 @@ package store
 
 import (
 	"github.com/Project-Sylos/Sylos-DB/pkg/bolt"
+	bbolt "go.etcd.io/bbolt"
 )
 
 // SubtreeStats contains statistics about a subtree.
@@ -158,28 +159,31 @@ func (s *Store) DeleteSubtree(queueType, rootPath string) error {
 		return nil // Nothing to delete
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	topic := getTopicForQueueType(queueType)
 
-	// Check conflicts before deletion (all levels since we don't know which levels are affected)
-	qr := QueueRound{QueueType: queueType, Level: -1}
-	if err := s.checkDomainConflict(DomainDependency{
-		Nodes:  []QueueRound{qr},
-		Status: []QueueRound{qr},
-	}); err != nil {
+	// Check conflicts: reads from nodes, status, children, join mappings, path mappings buckets
+	bucketsToRead := [][]string{
+		bolt.GetNodesBucketPath(queueType),
+		bolt.GetChildrenBucketPath(queueType),
+		bolt.GetSrcToDstBucketPath(),
+		bolt.GetDstToSrcBucketPath(),
+		bolt.GetPathToULIDBucketPath(queueType),
+	}
+	if err := s.checkConflict(topic, bucketsToRead); err != nil {
 		return err
 	}
 
-	// Queue the batch delete operation
-	return s.queueWrite(func(db *bolt.DB) error {
-		return bolt.BatchDeleteNodes(db, queueType, nodesToDelete)
-	}, DomainImpact{
-		Pending: []QueueRound{qr}, // May affect pending
-		Status:  []QueueRound{qr}, // Affects status buckets
-		Nodes:   []QueueRound{qr}, // Affects node data
-		Lookups: true,             // Affects children index, path-to-ULID, join mappings
-		Stats:   true,             // Affects stats
-	})
+	// Queue the batch delete operation: BatchDeleteNodesInTx touches many buckets
+	bucketsToWrite := [][]string{
+		bolt.GetNodesBucketPath(queueType),
+		bolt.GetChildrenBucketPath(queueType),
+		bolt.GetSrcToDstBucketPath(),
+		bolt.GetDstToSrcBucketPath(),
+		bolt.GetPathToULIDBucketPath(queueType),
+	}
+	return s.queueWrite(topic, func(tx *bbolt.Tx) error {
+		return bolt.BatchDeleteNodesInTx(tx, queueType, nodesToDelete)
+	}, bucketsToWrite, nil)
 }
 
 // CountExcludedNodes counts all excluded nodes (ExplicitExcluded OR InheritedExcluded) in a queue.
@@ -188,14 +192,13 @@ func (s *Store) DeleteSubtree(queueType, rootPath string) error {
 // This is a test utility method and should not be used in production code.
 // It performs O(n) iteration through all nodes in the queue.
 func (s *Store) CountExcludedNodes(queueType string) (int, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	topic := getTopicForQueueType(queueType)
 
-	// Check conflicts before reading (all levels)
-	qr := QueueRound{QueueType: queueType, Level: -1}
-	if err := s.checkDomainConflict(DomainDependency{
-		Nodes: []QueueRound{qr},
-	}); err != nil {
+	// Check conflicts: reads from nodes bucket
+	bucketsToRead := [][]string{
+		bolt.GetNodesBucketPath(queueType),
+	}
+	if err := s.checkConflict(topic, bucketsToRead); err != nil {
 		return 0, err
 	}
 

@@ -67,19 +67,24 @@ func GetLogLevelBucket(tx *bolt.Tx, level string) *bolt.Bucket {
 
 // InsertLogEntry inserts a single log entry into BoltDB under the appropriate level bucket.
 func InsertLogEntry(db *DB, entry LogEntry) error {
+	return db.Update(func(tx *bolt.Tx) error {
+		return InsertLogEntryInTx(tx, entry)
+	})
+}
+
+// InsertLogEntryInTx writes a log entry to the database within an existing transaction.
+func InsertLogEntryInTx(tx *bolt.Tx, entry LogEntry) error {
 	data, err := SerializeLogEntry(entry)
 	if err != nil {
 		return fmt.Errorf("failed to serialize log entry: %w", err)
 	}
 
-	return db.Update(func(tx *bolt.Tx) error {
-		levelBucket, err := GetOrCreateLogLevelBucket(tx, entry.Level)
-		if err != nil {
-			return err
-		}
+	levelBucket, err := GetOrCreateLogLevelBucket(tx, entry.Level)
+	if err != nil {
+		return err
+	}
 
-		return levelBucket.Put([]byte(entry.ID), data)
-	})
+	return levelBucket.Put([]byte(entry.ID), data)
 }
 
 // GetLogEntry retrieves a log entry by ID and level.

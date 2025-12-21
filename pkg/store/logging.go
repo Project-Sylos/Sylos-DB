@@ -8,6 +8,7 @@ import (
 
 	"github.com/Project-Sylos/Sylos-DB/pkg/bolt"
 	"github.com/Project-Sylos/Sylos-DB/pkg/utils"
+	bbolt "go.etcd.io/bbolt"
 )
 
 // RecordLog writes a log entry to the database.
@@ -25,12 +26,13 @@ func (s *Store) RecordLog(level, entity, entityID, message string) error {
 		Message:   message,
 	}
 
-	// Queue the write operation
-	return s.queueWrite(func(db *bolt.DB) error {
-		return bolt.InsertLogEntry(db, entry)
-	}, DomainImpact{
-		Logs: true,
-	})
+	// Queue the write operation: writes to logs bucket (topic="logs")
+	bucketsToWrite := [][]string{
+		bolt.GetLogsBucketPath(),
+	}
+	return s.queueWrite("logs", func(tx *bbolt.Tx) error {
+		return bolt.InsertLogEntryInTx(tx, entry)
+	}, bucketsToWrite, nil)
 }
 
 // QueryLogs retrieves log entries from the database.
@@ -42,9 +44,6 @@ func (s *Store) RecordLog(level, entity, entityID, message string) error {
 // Log reads are used for UI polling (200ms interval) and don't require immediate consistency.
 // Logs are flushed at semantic barriers (e.g., shutdown, phase transitions) for durability.
 func (s *Store) QueryLogs(level string, limit int) ([]*bolt.LogEntry, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	// Logs are eventually consistent - no conflict check needed
 	// UI polling can tolerate slight delays (buffer flushes every 2 seconds by default)
 

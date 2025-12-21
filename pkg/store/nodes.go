@@ -7,27 +7,71 @@ import (
 	"fmt"
 
 	"github.com/Project-Sylos/Sylos-DB/pkg/bolt"
+	bbolt "go.etcd.io/bbolt"
 )
 
-// RegisterNode atomically inserts a node into the database with all necessary indexes and stats updates.
-// This consolidates: node insertion, status bucket membership, status-lookup index, children index,
-// stats updates, and optional SRC↔DST join mappings.
+// RegisterNode inserts a new node into the database with its status bucket, lookup index, and stats updates.
+// This performs an IMMEDIATE write (bypasses the buffer) and is intended for root seeding or single-node inserts.
+// For traversal task completion (parent + children), use CommitTraversalTask instead (which is buffered).
 func (s *Store) RegisterNode(queueType string, level int, status string, state *bolt.NodeState) error {
 	if state.ID == "" {
 		return fmt.Errorf("node ID (ULID) cannot be empty")
 	}
 
-	qr := QueueRound{QueueType: queueType, Level: level}
+	// Immediate write - no buffering
+	// This is used for root seeding which needs to be immediately visible
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		// Ensure TraversalStatus is set
+		if state.TraversalStatus == "" {
+			state.TraversalStatus = status
+		}
 
-	// Queue the write operation with domain impact declaration
-	return s.queueWrite(func(db *bolt.DB) error {
-		return bolt.InsertNodeWithIndex(db, queueType, level, status, state)
-	}, DomainImpact{
-		Pending: []QueueRound{qr},     // Affects pending if status is "pending"
-		Status:  []QueueRound{qr},     // Affects status bucket for this level
-		Nodes:   []QueueRound{qr},     // Affects node data at this level
-		Lookups: state.ParentID != "", // Affects lookups if has parent (children index)
-		Stats:   true,                 // Always affects stats
+		// Serialize node state
+		nodeData, err := state.Serialize()
+		if err != nil {
+			return fmt.Errorf("failed to serialize node state: %w", err)
+		}
+
+		// Insert into nodes bucket
+		traversalBucket := tx.Bucket([]byte("Traversal-Data"))
+		if traversalBucket == nil {
+			return fmt.Errorf("Traversal-Data bucket not found")
+		}
+		queueBucket := traversalBucket.Bucket([]byte(queueType))
+		if queueBucket == nil {
+			return fmt.Errorf("queue bucket %s not found", queueType)
+		}
+		nodesBucket := queueBucket.Bucket([]byte("nodes"))
+		if nodesBucket == nil {
+			return fmt.Errorf("nodes bucket not found for %s", queueType)
+		}
+		if err := nodesBucket.Put([]byte(state.ID), nodeData); err != nil {
+			return fmt.Errorf("failed to insert node: %w", err)
+		}
+
+		// Insert into status bucket
+		statusBucket, err := bolt.GetOrCreateStatusBucket(tx, queueType, level, status)
+		if err != nil {
+			return fmt.Errorf("failed to get status bucket: %w", err)
+		}
+		if err := statusBucket.Put([]byte(state.ID), []byte{}); err != nil {
+			return fmt.Errorf("failed to add to status bucket: %w", err)
+		}
+
+		// Update status-lookup
+		if err := bolt.UpdateStatusLookup(tx, queueType, level, []byte(state.ID), status); err != nil {
+			return fmt.Errorf("failed to update status lookup: %w", err)
+		}
+
+		// Update stats
+		if err := bolt.UpdateBucketStats(tx, bolt.GetNodesBucketPath(queueType), 1); err != nil {
+			return fmt.Errorf("failed to update nodes stats: %w", err)
+		}
+		if err := bolt.UpdateBucketStats(tx, bolt.GetStatusBucketPath(queueType, level, status), 1); err != nil {
+			return fmt.Errorf("failed to update status stats: %w", err)
+		}
+
+		return nil
 	})
 }
 
@@ -39,31 +83,35 @@ func (s *Store) TransitionNodeStatus(queueType string, level int, oldStatus, new
 		return fmt.Errorf("node ID cannot be empty")
 	}
 
-	qr := QueueRound{QueueType: queueType, Level: level}
+	topic := getTopicForQueueType(queueType)
 
-	// For reads after writes, we need to check conflicts
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Check if we need to flush before this operation (in case we need to read current state)
-	if err := s.checkDomainConflict(DomainDependency{
-		Nodes:  []QueueRound{qr},
-		Status: []QueueRound{qr},
-	}); err != nil {
+	// Check conflicts: reads from nodes bucket and status buckets
+	bucketsToRead := [][]string{
+		bolt.GetNodesBucketPath(queueType),
+		bolt.GetStatusBucketPath(queueType, level, oldStatus),
+		bolt.GetStatusLookupBucketPath(queueType, level),
+	}
+	if err := s.checkConflict(topic, bucketsToRead); err != nil {
 		return err
 	}
 
-	// Queue the write operation with domain impact
-	return s.queueWrite(func(db *bolt.DB) error {
-		// Use the public UpdateNodeByID method
-		_, err := bolt.UpdateNodeByID(db, queueType, level, "status", oldStatus, newStatus, nodeID)
-		return err
-	}, DomainImpact{
-		Pending: []QueueRound{qr}, // May affect pending bucket
-		Status:  []QueueRound{qr}, // Affects status buckets
-		Nodes:   []QueueRound{qr}, // Affects node data
-		Stats:   true,             // Affects stats
-	})
+	// Queue the write operation: writes to nodes, status buckets, status-lookup, and stats
+	bucketsToWrite := [][]string{
+		bolt.GetNodesBucketPath(queueType),
+		bolt.GetStatusBucketPath(queueType, level, oldStatus),
+		bolt.GetStatusBucketPath(queueType, level, newStatus),
+		bolt.GetStatusLookupBucketPath(queueType, level),
+	}
+
+	// Stats deltas
+	statsDeltas := make(map[string]int64)
+	statsDeltas[normalizeBucketPath(bolt.GetStatusBucketPath(queueType, level, oldStatus))] = -1
+	statsDeltas[normalizeBucketPath(bolt.GetStatusBucketPath(queueType, level, newStatus))] = 1
+
+	return s.queueWrite(topic, func(tx *bbolt.Tx) error {
+		// Use the TX-level status update
+		return bolt.UpdateNodeStatusInTxByID(tx, queueType, level, oldStatus, newStatus, []byte(nodeID))
+	}, bucketsToWrite, statsDeltas)
 }
 
 // UpdateNodeCopyStatus updates only the copy status field of a node.
@@ -73,39 +121,49 @@ func (s *Store) UpdateNodeCopyStatus(nodeID string, newCopyStatus string) error 
 		return fmt.Errorf("node ID cannot be empty")
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Check conflicts before reading node state (all levels for both queues)
-	// We don't know which level the node is at, so we flush if any nodes are dirty
-	// This is conservative but correct
-	if err := s.checkDomainConflict(DomainDependency{
-		Nodes: []QueueRound{
-			{QueueType: "SRC", Level: -1}, // -1 indicates "all levels"
-			{QueueType: "DST", Level: -1},
-		},
-	}); err != nil {
+	// Check conflicts: reads from nodes buckets (try both SRC and DST since we don't know which one)
+	bucketsToRead := [][]string{
+		bolt.GetNodesBucketPath("SRC"),
+		bolt.GetNodesBucketPath("DST"),
+	}
+	// Check both buffers
+	if err := s.checkConflict("src", bucketsToRead); err != nil {
+		return err
+	}
+	if err := s.checkConflict("dst", bucketsToRead); err != nil {
 		return err
 	}
 
-	// Queue the write operation
-	// Note: We need to determine queueType by checking which bucket has the node
-	// For now, try both SRC and DST
-	return s.queueWrite(func(db *bolt.DB) error {
-		// Try SRC first
-		_, err := bolt.UpdateNodeByID(db, "SRC", 0, "copy", "", newCopyStatus, nodeID)
-		if err == nil {
-			return nil
+	// Queue the write operation - we need to determine which queue, so queue to both topics
+	// (Only one will actually write, the other will fail gracefully if node not found)
+	bucketsToWriteSrc := [][]string{
+		bolt.GetNodesBucketPath("SRC"),
+	}
+	bucketsToWriteDst := [][]string{
+		bolt.GetNodesBucketPath("DST"),
+	}
+
+	// Try SRC first
+	if err := s.queueWrite("src", func(tx *bbolt.Tx) error {
+		srcState, err := bolt.GetNodeStateInTx(tx, "SRC", nodeID)
+		if err == nil && srcState != nil {
+			srcState.CopyStatus = newCopyStatus
+			return bolt.SetNodeStateInTx(tx, "SRC", []byte(nodeID), srcState)
 		}
-		// Try DST
-		_, err = bolt.UpdateNodeByID(db, "DST", 0, "copy", "", newCopyStatus, nodeID)
+		return nil // Not in SRC, try DST
+	}, bucketsToWriteSrc, nil); err != nil {
 		return err
-	}, DomainImpact{
-		Nodes: []QueueRound{
-			{QueueType: "SRC", Level: -1}, // Conservative: mark all SRC nodes dirty
-			{QueueType: "DST", Level: -1}, // Conservative: mark all DST nodes dirty
-		},
-	})
+	}
+
+	// Try DST
+	return s.queueWrite("dst", func(tx *bbolt.Tx) error {
+		dstState, err := bolt.GetNodeStateInTx(tx, "DST", nodeID)
+		if err == nil && dstState != nil {
+			dstState.CopyStatus = newCopyStatus
+			return bolt.SetNodeStateInTx(tx, "DST", []byte(nodeID), dstState)
+		}
+		return fmt.Errorf("node not found: %s", nodeID)
+	}, bucketsToWriteDst, nil)
 }
 
 // SetNodeExclusionFlag updates the ExplicitExcluded flag on a node without affecting status buckets.
@@ -119,21 +177,23 @@ func (s *Store) SetNodeExclusionFlag(queueType, nodeID string, explicitExcluded 
 		return fmt.Errorf("queue type cannot be empty")
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	topic := getTopicForQueueType(queueType)
 
-	// Check conflicts before reading node state (all levels since we don't know which level)
-	qr := QueueRound{QueueType: queueType, Level: -1}
-	if err := s.checkDomainConflict(DomainDependency{
-		Nodes: []QueueRound{qr},
-	}); err != nil {
+	// Check conflicts: reads from nodes bucket
+	bucketsToRead := [][]string{
+		bolt.GetNodesBucketPath(queueType),
+	}
+	if err := s.checkConflict(topic, bucketsToRead); err != nil {
 		return err
 	}
 
-	// Queue the write operation
-	return s.queueWrite(func(db *bolt.DB) error {
+	// Queue the write operation: writes to nodes bucket
+	bucketsToWrite := [][]string{
+		bolt.GetNodesBucketPath(queueType),
+	}
+	return s.queueWrite(topic, func(tx *bbolt.Tx) error {
 		// Get current node state
-		nodeState, err := bolt.GetNodeState(db, queueType, nodeID)
+		nodeState, err := bolt.GetNodeStateInTx(tx, queueType, nodeID)
 		if err != nil {
 			return fmt.Errorf("failed to get node state: %w", err)
 		}
@@ -145,10 +205,8 @@ func (s *Store) SetNodeExclusionFlag(queueType, nodeID string, explicitExcluded 
 		nodeState.ExplicitExcluded = explicitExcluded
 
 		// Save updated node state
-		return bolt.SetNodeState(db, queueType, []byte(nodeID), nodeState)
-	}, DomainImpact{
-		Nodes: []QueueRound{qr}, // Mark nodes at all levels as dirty
-	})
+		return bolt.SetNodeStateInTx(tx, queueType, []byte(nodeID), nodeState)
+	}, bucketsToWrite, nil)
 }
 
 // DeleteNode removes a node and all its associated indexes and stats.
@@ -157,26 +215,29 @@ func (s *Store) DeleteNode(queueType string, nodeID string) error {
 		return fmt.Errorf("node ID cannot be empty")
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	topic := getTopicForQueueType(queueType)
 
-	// Check conflicts before reading node state (all levels since we don't know which level)
-	qr := QueueRound{QueueType: queueType, Level: -1}
-	if err := s.checkDomainConflict(DomainDependency{
-		Nodes:  []QueueRound{qr},
-		Status: []QueueRound{qr},
-	}); err != nil {
+	// Check conflicts: reads from nodes and status buckets (we don't know which level)
+	// For delete, we need to read the node first to determine what to delete
+	bucketsToRead := [][]string{
+		bolt.GetNodesBucketPath(queueType),
+		// We don't know the exact status buckets, so we can't list them all
+		// The delete operation will handle reading the node state to determine what to delete
+	}
+	if err := s.checkConflict(topic, bucketsToRead); err != nil {
 		return err
 	}
 
-	// Queue the write operation with domain impact
-	return s.queueWrite(func(db *bolt.DB) error {
-		return bolt.BatchDeleteNodes(db, queueType, []string{nodeID})
-	}, DomainImpact{
-		Pending: []QueueRound{qr}, // May affect pending
-		Status:  []QueueRound{qr}, // Affects status buckets
-		Nodes:   []QueueRound{qr}, // Affects node data
-		Lookups: true,             // Affects children index
-		Stats:   true,             // Affects stats
-	})
+	// Queue the write operation: BatchDeleteNodesInTx handles all the deletes
+	// It touches: nodes, status buckets, status-lookup, children, join mappings, path mappings, stats
+	// We can't know all the exact buckets ahead of time, so we mark the main ones
+	bucketsToWrite := [][]string{
+		bolt.GetNodesBucketPath(queueType),
+		bolt.GetChildrenBucketPath(queueType),
+		bolt.GetSrcToDstBucketPath(), // May affect join mappings
+		bolt.GetDstToSrcBucketPath(),
+	}
+	return s.queueWrite(topic, func(tx *bbolt.Tx) error {
+		return bolt.BatchDeleteNodesInTx(tx, queueType, []string{nodeID})
+	}, bucketsToWrite, nil)
 }

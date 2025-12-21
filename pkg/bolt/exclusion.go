@@ -56,47 +56,60 @@ func ScanExclusionHoldingBucketByLevel(db *DB, queueType string, currentLevel in
 	var hasHigherLevels bool
 
 	err := db.View(func(tx *bolt.Tx) error {
-		// Scan both exclusion and unexclusion buckets
-		for _, mode := range []string{"exclude", "unexclude"} {
-			holdingBucket := GetHoldingBucket(tx, queueType, mode)
-			if holdingBucket == nil {
-				continue // Bucket doesn't exist, skip
-			}
-
-			cursor := holdingBucket.Cursor()
-			entriesCollected := 0
-
-			// Scan entire bucket O(n)
-			for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
-				if len(v) != 8 {
-					continue // Skip invalid entries
-				}
-
-				// Decode depth level (int64 stored as 8 bytes, big-endian)
-				depth := int(binary.BigEndian.Uint64(v))
-
-				if depth == currentLevel {
-					if entriesCollected < limit {
-						entries = append(entries, ExclusionEntry{
-							NodeID: string(k), // k is the ULID
-							Depth:  depth,
-							Mode:   mode,
-						})
-						entriesCollected++
-					}
-					// Continue scanning to check for higher levels
-				} else if depth > currentLevel {
-					hasHigherLevels = true
-					// Continue scanning - may have more entries at current level
-				}
-				// Skip entries with depth < currentLevel (already processed in earlier rounds)
-			}
-		}
-
-		return nil
+		return scanExclusionHoldingBucketByLevelInTx(tx, queueType, currentLevel, limit, &entries, &hasHigherLevels)
 	})
 
 	return entries, hasHigherLevels, err
+}
+
+// ScanExclusionHoldingBucketByLevelInTx scans both exclusion-holding and unexclusion-holding buckets within an existing transaction.
+func ScanExclusionHoldingBucketByLevelInTx(tx *bolt.Tx, queueType string, currentLevel int, limit int) ([]ExclusionEntry, bool, error) {
+	var entries []ExclusionEntry
+	var hasHigherLevels bool
+	err := scanExclusionHoldingBucketByLevelInTx(tx, queueType, currentLevel, limit, &entries, &hasHigherLevels)
+	return entries, hasHigherLevels, err
+}
+
+// scanExclusionHoldingBucketByLevelInTx is the internal implementation.
+func scanExclusionHoldingBucketByLevelInTx(tx *bolt.Tx, queueType string, currentLevel int, limit int, entries *[]ExclusionEntry, hasHigherLevels *bool) error {
+	// Scan both exclusion and unexclusion buckets
+	for _, mode := range []string{"exclude", "unexclude"} {
+		holdingBucket := GetHoldingBucket(tx, queueType, mode)
+		if holdingBucket == nil {
+			continue // Bucket doesn't exist, skip
+		}
+
+		cursor := holdingBucket.Cursor()
+		entriesCollected := 0
+
+		// Scan entire bucket O(n)
+		for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
+			if len(v) != 8 {
+				continue // Skip invalid entries
+			}
+
+			// Decode depth level (int64 stored as 8 bytes, big-endian)
+			depth := int(binary.BigEndian.Uint64(v))
+
+			if depth == currentLevel {
+				if entriesCollected < limit || limit == 0 {
+					*entries = append(*entries, ExclusionEntry{
+						NodeID: string(k), // k is the ULID
+						Depth:  depth,
+						Mode:   mode,
+					})
+					entriesCollected++
+				}
+				// Continue scanning to check for higher levels
+			} else if depth > currentLevel {
+				*hasHigherLevels = true
+				// Continue scanning - may have more entries at current level
+			}
+			// Skip entries with depth < currentLevel (already processed in earlier rounds)
+		}
+	}
+
+	return nil
 }
 
 // HasExclusionHoldingEntries checks if either exclusion-holding or unexclusion-holding bucket has any entries.
@@ -134,29 +147,39 @@ func HasExclusionHoldingEntries(db *DB, queueType string) (bool, error) {
 // AddHoldingEntry adds a ULID to the appropriate holding bucket (exclusion or unexclusion) with its depth level.
 func AddHoldingEntry(db *DB, queueType string, nodeID string, depth int, mode string) error {
 	return db.Update(func(tx *bolt.Tx) error {
-		holdingBucket, err := GetOrCreateHoldingBucket(tx, queueType, mode)
-		if err != nil {
-			return err
-		}
-
-		// Encode depth level as 8 bytes, big-endian
-		depthBytes := make([]byte, 8)
-		binary.BigEndian.PutUint64(depthBytes, uint64(depth))
-
-		return holdingBucket.Put([]byte(nodeID), depthBytes)
+		return AddHoldingEntryInTx(tx, queueType, nodeID, depth, mode)
 	})
+}
+
+// AddHoldingEntryInTx adds a ULID to the appropriate holding bucket within an existing transaction.
+func AddHoldingEntryInTx(tx *bolt.Tx, queueType string, nodeID string, depth int, mode string) error {
+	holdingBucket, err := GetOrCreateHoldingBucket(tx, queueType, mode)
+	if err != nil {
+		return err
+	}
+
+	// Encode depth level as 8 bytes, big-endian
+	depthBytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(depthBytes, uint64(depth))
+
+	return holdingBucket.Put([]byte(nodeID), depthBytes)
 }
 
 // RemoveHoldingEntry removes a ULID from the appropriate holding bucket (exclusion or unexclusion).
 func RemoveHoldingEntry(db *DB, queueType string, nodeID string, mode string) error {
 	return db.Update(func(tx *bolt.Tx) error {
-		holdingBucket := GetHoldingBucket(tx, queueType, mode)
-		if holdingBucket == nil {
-			return nil // Bucket doesn't exist, nothing to remove
-		}
-
-		return holdingBucket.Delete([]byte(nodeID))
+		return RemoveHoldingEntryInTx(tx, queueType, nodeID, mode)
 	})
+}
+
+// RemoveHoldingEntryInTx removes a ULID from the appropriate holding bucket within an existing transaction.
+func RemoveHoldingEntryInTx(tx *bolt.Tx, queueType string, nodeID string, mode string) error {
+	holdingBucket := GetHoldingBucket(tx, queueType, mode)
+	if holdingBucket == nil {
+		return nil // Bucket doesn't exist, nothing to remove
+	}
+
+	return holdingBucket.Delete([]byte(nodeID))
 }
 
 // CheckHoldingEntry checks if a ULID exists in either holding bucket (O(1) lookup).

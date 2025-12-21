@@ -311,7 +311,7 @@ func (db *DB) SyncCounts() error {
 				}
 
 				// Sync all status buckets for this level
-				statuses := []string{StatusPending, StatusSuccessful, StatusFailed}
+				statuses := []string{StatusPending, StatusInProgress, StatusSuccessful, StatusFailed}
 				if queueType == "DST" {
 					statuses = append(statuses, StatusNotOnSrc)
 				}
@@ -366,32 +366,42 @@ func (db *DB) SyncCounts() error {
 // statsJSON is the JSON-encoded stats data to store.
 func (db *DB) SetQueueStats(queueKey string, statsJSON []byte) error {
 	return db.Update(func(tx *bolt.Tx) error {
-		queueStatsBucket, err := getOrCreateBucket(tx, GetQueueStatsBucketPath())
-		if err != nil {
-			return fmt.Errorf("failed to get queue-stats bucket: %w", err)
-		}
-
-		return queueStatsBucket.Put([]byte(queueKey), statsJSON)
+		return SetQueueStatsInTx(tx, queueKey, statsJSON)
 	})
+}
+
+// SetQueueStatsInTx writes queue statistics within an existing transaction.
+func SetQueueStatsInTx(tx *bolt.Tx, queueKey string, statsJSON []byte) error {
+	queueStatsBucket, err := getOrCreateBucket(tx, GetQueueStatsBucketPath())
+	if err != nil {
+		return fmt.Errorf("failed to get queue-stats bucket: %w", err)
+	}
+
+	return queueStatsBucket.Put([]byte(queueKey), statsJSON)
 }
 
 // SetQueueStatsBatch writes multiple queue statistics in a single transaction.
 // statsMap is a map of queue key -> JSON-encoded stats.
 func (db *DB) SetQueueStatsBatch(statsMap map[string][]byte) error {
 	return db.Update(func(tx *bolt.Tx) error {
-		queueStatsBucket, err := getOrCreateBucket(tx, GetQueueStatsBucketPath())
-		if err != nil {
-			return fmt.Errorf("failed to get queue-stats bucket: %w", err)
-		}
-
-		for queueKey, statsJSON := range statsMap {
-			if err := queueStatsBucket.Put([]byte(queueKey), statsJSON); err != nil {
-				return fmt.Errorf("failed to write stats for %s: %w", queueKey, err)
-			}
-		}
-
-		return nil
+		return SetQueueStatsBatchInTx(tx, statsMap)
 	})
+}
+
+// SetQueueStatsBatchInTx writes multiple queue statistics within an existing transaction.
+func SetQueueStatsBatchInTx(tx *bolt.Tx, statsMap map[string][]byte) error {
+	queueStatsBucket, err := getOrCreateBucket(tx, GetQueueStatsBucketPath())
+	if err != nil {
+		return fmt.Errorf("failed to get queue-stats bucket: %w", err)
+	}
+
+	for queueKey, statsJSON := range statsMap {
+		if err := queueStatsBucket.Put([]byte(queueKey), statsJSON); err != nil {
+			return fmt.Errorf("failed to write stats for %s: %w", queueKey, err)
+		}
+	}
+
+	return nil
 }
 
 // GetQueueStats retrieves queue statistics from the queue-stats bucket.

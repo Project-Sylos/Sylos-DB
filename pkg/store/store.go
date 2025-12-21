@@ -4,10 +4,13 @@
 package store
 
 import (
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/Project-Sylos/Sylos-DB/pkg/bolt"
+	bbolt "go.etcd.io/bbolt"
 )
 
 // BarrierReason represents the semantic reason for establishing a consistency barrier.
@@ -30,35 +33,16 @@ const (
 // It consolidates multi-step operations, provides read-your-writes consistency,
 // and exposes semantic barriers for coordination points.
 type Store struct {
-	db     *bolt.DB
-	buffer *writeBuffer
-	mu     sync.RWMutex
+	db      *bolt.DB
+	buffers map[string]*writeBuffer // Topic-based buffers: "src", "dst", "logs"
 }
 
-// QueueRound represents a (queueType, level) pair for domain tracking.
-type QueueRound struct {
-	QueueType string
-	Level     int
-}
-
-// DirtyDomains tracks which domain slices have unflushed writes.
-// This is O(1) metadata, not a scan of buffered operations.
-type DirtyDomains struct {
-	pendingByRound map[QueueRound]bool // Pending index affected
-	statusByRound  map[QueueRound]bool // Status indexes affected
-	nodesByRound   map[QueueRound]bool // Node data affected
-	lookups        bool                // Path-to-ULID, SRC↔DST mappings
-	stats          bool                // Stats bucket affected
-	logs           bool                // Log writes
-	exclusion      bool                // Exclusion status/holding buckets
-	queueStats     bool                // Queue observer metrics
-}
-
-// writeBuffer tracks pending write operations and affected domain slices.
+// writeBuffer tracks pending write operations for a specific topic.
 type writeBuffer struct {
-	operations   []writeOp
-	dirtyDomains DirtyDomains
-	mu           sync.Mutex
+	topic        string          // "src", "dst", or "logs"
+	operations   []writeOp       // Buffered write operations
+	dirtyBuckets map[string]bool // Bucket paths (as strings) that have pending writes
+	mu           sync.Mutex      // Protects operations and dirtyBuckets
 
 	// Buffer configuration
 	maxSize       int
@@ -67,22 +51,30 @@ type writeBuffer struct {
 	stopChan      chan struct{}
 }
 
-// writeOp represents a pending write operation with its domain impact.
+// writeOp represents a pending write operation.
 type writeOp struct {
-	fn           func(*bolt.DB) error
-	domainImpact DomainImpact
+	fn          func(*bbolt.Tx) error // Write operation function
+	buckets     []string              // Bucket paths this write touches (normalized to strings)
+	statsDeltas map[string]int64      // Bucket path → delta (for accumulation)
 }
 
-// DomainImpact describes which domain slices a write operation affects.
-type DomainImpact struct {
-	Pending    []QueueRound
-	Status     []QueueRound
-	Nodes      []QueueRound
-	Lookups    bool
-	Stats      bool
-	Logs       bool
-	Exclusion  bool
-	QueueStats bool
+// normalizeBucketPath converts a bucket path []string to a normalized string for comparison.
+// Example: ["Traversal-Data", "SRC", "nodes"] -> "Traversal-Data/SRC/nodes"
+func normalizeBucketPath(path []string) string {
+	return strings.Join(path, "/")
+}
+
+// getTopicForQueueType returns the buffer topic for a given queue type.
+// "SRC" -> "src", "DST" -> "dst", anything else -> "src" (default)
+func getTopicForQueueType(queueType string) string {
+	switch queueType {
+	case "SRC":
+		return "src"
+	case "DST":
+		return "dst"
+	default:
+		return "src" // Default to src
+	}
 }
 
 // Open creates a new Store instance wrapping a bolt.DB.
@@ -93,38 +85,42 @@ func Open(dbPath string) (*Store, error) {
 	}
 
 	s := &Store{
-		db: db,
-		buffer: &writeBuffer{
-			operations: make([]writeOp, 0, 1000),
-			dirtyDomains: DirtyDomains{
-				pendingByRound: make(map[QueueRound]bool),
-				statusByRound:  make(map[QueueRound]bool),
-				nodesByRound:   make(map[QueueRound]bool),
-			},
+		db:      db,
+		buffers: make(map[string]*writeBuffer),
+	}
+
+	// Create topic-based buffers
+	topics := []string{"src", "dst", "logs"}
+	for _, topic := range topics {
+		buffer := &writeBuffer{
+			topic:         topic,
+			operations:    make([]writeOp, 0, 1000),
+			dirtyBuckets:  make(map[string]bool),
 			maxSize:       1000,
 			flushInterval: 2 * time.Second,
 			stopChan:      make(chan struct{}),
-		},
-	}
+		}
+		buffer.ticker = time.NewTicker(buffer.flushInterval)
+		s.buffers[topic] = buffer
 
-	// Start background flush ticker
-	s.buffer.ticker = time.NewTicker(s.buffer.flushInterval)
-	go s.buffer.flushLoop(s)
+		// Start background flush ticker for each buffer
+		go buffer.flushLoop(s)
+	}
 
 	return s, nil
 }
 
 // Close flushes any pending writes and closes the underlying database.
 func (s *Store) Close() error {
-	// Stop background flusher
-	close(s.buffer.stopChan)
-	if s.buffer.ticker != nil {
-		s.buffer.ticker.Stop()
-	}
-
-	// Flush any remaining writes
-	if err := s.flushBuffer(); err != nil {
-		return err
+	// Stop all background flushers and flush buffers
+	for topic, buffer := range s.buffers {
+		close(buffer.stopChan)
+		if buffer.ticker != nil {
+			buffer.ticker.Stop()
+		}
+		if err := s.flushBuffer(topic); err != nil {
+			return fmt.Errorf("failed to flush %s buffer: %w", topic, err)
+		}
 	}
 
 	return s.db.Close()
@@ -133,12 +129,11 @@ func (s *Store) Close() error {
 // Barrier establishes a consistency checkpoint at a semantic coordination point.
 // All prior writes are guaranteed to be visible, consistent, and durable after this call.
 func (s *Store) Barrier(reason BarrierReason) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Flush all buffered writes
-	if err := s.flushBuffer(); err != nil {
-		return err
+	// Flush all buffered writes (flushBuffer handles its own locking)
+	for topic := range s.buffers {
+		if err := s.flushBuffer(topic); err != nil {
+			return fmt.Errorf("failed to flush %s buffer: %w", topic, err)
+		}
 	}
 
 	// For critical barriers, ensure durability with fsync
@@ -148,143 +143,140 @@ func (s *Store) Barrier(reason BarrierReason) error {
 	return nil
 }
 
-// flushBuffer writes all buffered operations to the database.
-// Caller must hold s.mu lock.
-func (s *Store) flushBuffer() error {
-	s.buffer.mu.Lock()
-	defer s.buffer.mu.Unlock()
+// flushBuffer writes all buffered operations for a topic to the database in ONE transaction.
+// topic is the buffer topic ("src", "dst", or "logs").
+// This function handles its own locking.
+func (s *Store) flushBuffer(topic string) error {
+	buffer := s.buffers[topic]
+	if buffer == nil {
+		return fmt.Errorf("unknown buffer topic: %s", topic)
+	}
 
-	if len(s.buffer.operations) == 0 {
+	buffer.mu.Lock()
+	defer buffer.mu.Unlock()
+
+	if len(buffer.operations) == 0 {
 		return nil
 	}
 
-	// Execute all buffered operations
-	for _, op := range s.buffer.operations {
-		if err := op.fn(s.db); err != nil {
-			return err
+	// Accumulate all stats deltas from buffered operations
+	accumulatedStats := make(map[string]int64)
+	for _, op := range buffer.operations {
+		for bucketPath, delta := range op.statsDeltas {
+			accumulatedStats[bucketPath] += delta
 		}
 	}
 
-	// Clear buffer and dirty domains
-	s.buffer.operations = s.buffer.operations[:0]
-	s.buffer.dirtyDomains = DirtyDomains{
-		pendingByRound: make(map[QueueRound]bool),
-		statusByRound:  make(map[QueueRound]bool),
-		nodesByRound:   make(map[QueueRound]bool),
+	// Execute ALL operations in ONE transaction
+	err := s.db.Update(func(tx *bbolt.Tx) error {
+		// Execute all buffered write operations
+		for _, op := range buffer.operations {
+			if err := op.fn(tx); err != nil {
+				return err
+			}
+		}
+
+		// Apply accumulated stats deltas (once per bucket)
+		for bucketPath, delta := range accumulatedStats {
+			if delta == 0 {
+				continue // Skip no-op
+			}
+			// Convert string path back to []string
+			pathParts := strings.Split(bucketPath, "/")
+			if err := bolt.UpdateBucketStats(tx, pathParts, delta); err != nil {
+				return fmt.Errorf("failed to update stats for %s: %w", bucketPath, err)
+			}
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return err
 	}
+
+	// Clear buffer and dirty buckets
+	buffer.operations = buffer.operations[:0]
+	buffer.dirtyBuckets = make(map[string]bool)
 
 	return nil
 }
 
-// checkDomainConflict checks if a read would conflict with buffered writes in specific domain slices.
-// If conflict detected, flushes buffer before returning.
-// Caller must hold s.mu lock.
-func (s *Store) checkDomainConflict(deps DomainDependency) error {
-	s.buffer.mu.Lock()
+// checkConflict checks if a read would conflict with buffered writes.
+// bucketPaths is the list of bucket paths the read operation touches (as [][]string, each will be normalized).
+// topic is the buffer topic to check ("src", "dst", or "logs").
+// If conflict detected, flushes the buffer before returning.
+// For "logs" topic, this always returns nil (logs are eventually consistent).
+func (s *Store) checkConflict(topic string, bucketPaths [][]string) error {
+	// Logs are eventually consistent - no conflict checking
+	if topic == "logs" {
+		return nil
+	}
+
+	buffer := s.buffers[topic]
+	if buffer == nil {
+		return fmt.Errorf("unknown buffer topic: %s", topic)
+	}
+
+	buffer.mu.Lock()
 	hasConflict := false
 
-	// Check pending index conflicts
-	for _, qr := range deps.Pending {
-		if s.buffer.dirtyDomains.pendingByRound[qr] {
+	// Normalize and check if any of the requested buckets have pending writes
+	for _, path := range bucketPaths {
+		normalizedPath := normalizeBucketPath(path)
+		if buffer.dirtyBuckets[normalizedPath] {
 			hasConflict = true
 			break
 		}
 	}
 
-	// Check status index conflicts
-	if !hasConflict {
-		for _, qr := range deps.Status {
-			if s.buffer.dirtyDomains.statusByRound[qr] {
-				hasConflict = true
-				break
-			}
-		}
-	}
-
-	// Check node data conflicts
-	if !hasConflict {
-		for _, qr := range deps.Nodes {
-			if s.buffer.dirtyDomains.nodesByRound[qr] {
-				hasConflict = true
-				break
-			}
-		}
-	}
-
-	// Check global domain conflicts
-	if !hasConflict {
-		hasConflict = (deps.Lookups && s.buffer.dirtyDomains.lookups) ||
-			(deps.Stats && s.buffer.dirtyDomains.stats) ||
-			(deps.Logs && s.buffer.dirtyDomains.logs) ||
-			(deps.Exclusion && s.buffer.dirtyDomains.exclusion) ||
-			(deps.QueueStats && s.buffer.dirtyDomains.queueStats)
-	}
-
-	s.buffer.mu.Unlock()
+	buffer.mu.Unlock()
 
 	if hasConflict {
-		return s.flushBuffer()
+		// flushBuffer handles its own locking
+		return s.flushBuffer(topic)
 	}
 
 	return nil
 }
 
-// DomainDependency describes which domain slices a read operation depends on.
-type DomainDependency struct {
-	Pending    []QueueRound
-	Status     []QueueRound
-	Nodes      []QueueRound
-	Lookups    bool
-	Stats      bool
-	Logs       bool
-	Exclusion  bool
-	QueueStats bool
-}
+// queueWrite adds a write operation to the buffer.
+// topic is the buffer topic ("src", "dst", or "logs").
+// fn is the write operation function.
+// bucketPaths is the list of bucket paths this write touches (as [][]string, each will be normalized).
+// statsDeltas is the map of bucket path strings (normalized) to stat deltas.
+func (s *Store) queueWrite(topic string, fn func(*bbolt.Tx) error, bucketPaths [][]string, statsDeltas map[string]int64) error {
+	buffer := s.buffers[topic]
+	if buffer == nil {
+		return fmt.Errorf("unknown buffer topic: %s", topic)
+	}
 
-// queueWrite adds a write operation to the buffer with its domain impact.
-func (s *Store) queueWrite(fn func(*bolt.DB) error, impact DomainImpact) error {
-	s.buffer.mu.Lock()
-	defer s.buffer.mu.Unlock()
+	buffer.mu.Lock()
+	defer buffer.mu.Unlock()
+
+	// Normalize bucket paths to strings
+	normalizedPaths := make([]string, len(bucketPaths))
+	for i, path := range bucketPaths {
+		normalizedPaths[i] = normalizeBucketPath(path)
+	}
 
 	// Add operation to buffer
-	s.buffer.operations = append(s.buffer.operations, writeOp{
-		fn:           fn,
-		domainImpact: impact,
+	buffer.operations = append(buffer.operations, writeOp{
+		fn:          fn,
+		buckets:     normalizedPaths,
+		statsDeltas: statsDeltas,
 	})
 
-	// Mark affected domain slices as dirty
-	for _, qr := range impact.Pending {
-		s.buffer.dirtyDomains.pendingByRound[qr] = true
-	}
-	for _, qr := range impact.Status {
-		s.buffer.dirtyDomains.statusByRound[qr] = true
-	}
-	for _, qr := range impact.Nodes {
-		s.buffer.dirtyDomains.nodesByRound[qr] = true
-	}
-	if impact.Lookups {
-		s.buffer.dirtyDomains.lookups = true
-	}
-	if impact.Stats {
-		s.buffer.dirtyDomains.stats = true
-	}
-	if impact.Logs {
-		s.buffer.dirtyDomains.logs = true
-	}
-	if impact.Exclusion {
-		s.buffer.dirtyDomains.exclusion = true
-	}
-	if impact.QueueStats {
-		s.buffer.dirtyDomains.queueStats = true
+	// Mark affected buckets as dirty
+	for _, path := range normalizedPaths {
+		buffer.dirtyBuckets[path] = true
 	}
 
 	// Flush if buffer is full
-	if len(s.buffer.operations) >= s.buffer.maxSize {
-		s.buffer.mu.Unlock()
-		s.mu.Lock()
-		err := s.flushBuffer()
-		s.mu.Unlock()
-		s.buffer.mu.Lock()
+	if len(buffer.operations) >= buffer.maxSize {
+		buffer.mu.Unlock()
+		err := s.flushBuffer(topic) // flushBuffer will acquire buffer.mu itself
+		buffer.mu.Lock()
 		return err
 	}
 
@@ -298,9 +290,7 @@ func (wb *writeBuffer) flushLoop(s *Store) {
 		case <-wb.stopChan:
 			return
 		case <-wb.ticker.C:
-			s.mu.Lock()
-			s.flushBuffer()
-			s.mu.Unlock()
+			s.flushBuffer(wb.topic) // flushBuffer handles its own locking
 		}
 	}
 }

@@ -12,13 +12,21 @@ import (
 // This is an O(1) operation using pre-computed stats.
 // bucketPath is the path to the bucket (e.g., ["Traversal-Data", "SRC", "nodes"]).
 func (s *Store) GetBucketCount(bucketPath []string) (int, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	// Stats bucket is shared - check both src and dst buffers
+	// Try to determine topic from path, default to checking both
+	topic := "src" // Default
+	if len(bucketPath) > 1 {
+		if bucketPath[1] == "DST" {
+			topic = "dst"
+		}
+	}
 
-	// Check conflicts for stats bucket
-	if err := s.checkDomainConflict(DomainDependency{
-		Stats: true,
-	}); err != nil {
+	// Check conflicts: reads from stats bucket (which is shared, but path might indicate queue)
+	// For simplicity, check the relevant topic's buffer
+	bucketsToRead := [][]string{
+		{"Traversal-Data", "STATS"}, // Stats bucket
+	}
+	if err := s.checkConflict(topic, bucketsToRead); err != nil {
 		return 0, err
 	}
 
@@ -34,26 +42,26 @@ func (s *Store) GetBucketCount(bucketPath []string) (int, error) {
 // This creates bidirectional mappings: SRC→DST and DST→SRC.
 // srcID is the SRC node ULID, dstID is the DST node ULID.
 func (s *Store) SetJoinMapping(srcID, dstID string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	// Join mappings span both queues - we need to queue writes to both buffers
+	// But we can do this as two separate queue writes since they're independent buckets
 
-	// Check conflicts before writing
-	if err := s.checkDomainConflict(DomainDependency{
-		Lookups: true,
-	}); err != nil {
+	// Write to src buffer (src-to-dst bucket)
+	srcBuckets := [][]string{
+		bolt.GetSrcToDstBucketPath(),
+	}
+	if err := s.queueWrite("src", func(tx *bbolt.Tx) error {
+		return bolt.SetJoinMappingInTx(tx, "src-to-dst", srcID, dstID)
+	}, srcBuckets, nil); err != nil {
 		return err
 	}
 
-	// Queue the write operation
-	return s.queueWrite(func(db *bolt.DB) error {
-		// Create both mappings in a single transaction
-		if err := bolt.SetJoinMapping(db, "src-to-dst", srcID, dstID); err != nil {
-			return err
-		}
-		return bolt.SetJoinMapping(db, "dst-to-src", dstID, srcID)
-	}, DomainImpact{
-		Lookups: true, // Affects join mapping lookups
-	})
+	// Write to dst buffer (dst-to-src bucket)
+	dstBuckets := [][]string{
+		bolt.GetDstToSrcBucketPath(),
+	}
+	return s.queueWrite("dst", func(tx *bbolt.Tx) error {
+		return bolt.SetJoinMappingInTx(tx, "dst-to-src", dstID, srcID)
+	}, dstBuckets, nil)
 }
 
 // GetJoinMapping retrieves a node mapping from the join lookup table.
@@ -62,13 +70,23 @@ func (s *Store) SetJoinMapping(srcID, dstID string) error {
 // For "dst-to-src": sourceID is DST node ULID, returns SRC node ULID.
 // Returns empty string if no mapping exists.
 func (s *Store) GetJoinMapping(mappingType, sourceID string) (string, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	var topic string
+	var bucketsToRead [][]string
+
+	if mappingType == "src-to-dst" {
+		topic = "src"
+		bucketsToRead = [][]string{
+			bolt.GetSrcToDstBucketPath(),
+		}
+	} else {
+		topic = "dst"
+		bucketsToRead = [][]string{
+			bolt.GetDstToSrcBucketPath(),
+		}
+	}
 
 	// Check conflicts before reading
-	if err := s.checkDomainConflict(DomainDependency{
-		Lookups: true,
-	}); err != nil {
+	if err := s.checkConflict(topic, bucketsToRead); err != nil {
 		return "", err
 	}
 
@@ -79,23 +97,21 @@ func (s *Store) GetJoinMapping(mappingType, sourceID string) (string, error) {
 // This allows looking up nodes by their filesystem path.
 // The path is hashed using SHA-256 for storage efficiency.
 func (s *Store) SetPathMapping(queueType, path, nodeID string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	topic := getTopicForQueueType(queueType)
 
-	// Check conflicts before writing
-	if err := s.checkDomainConflict(DomainDependency{
-		Lookups: true,
-	}); err != nil {
+	// Check conflicts: path mappings bucket
+	bucketsToRead := [][]string{
+		bolt.GetPathToULIDBucketPath(queueType),
+	}
+	if err := s.checkConflict(topic, bucketsToRead); err != nil {
 		return err
 	}
 
 	// Queue the write operation
-	return s.queueWrite(func(db *bolt.DB) error {
-		// SetPathToULIDMapping is a TX-level function, we need to wrap it in Update
-		return db.Update(func(tx *bbolt.Tx) error {
-			return bolt.SetPathToULIDMapping(tx, queueType, path, nodeID)
-		})
-	}, DomainImpact{
-		Lookups: true, // Affects path-to-ULID lookups
-	})
+	bucketsToWrite := [][]string{
+		bolt.GetPathToULIDBucketPath(queueType),
+	}
+	return s.queueWrite(topic, func(tx *bbolt.Tx) error {
+		return bolt.SetPathToULIDMapping(tx, queueType, path, nodeID)
+	}, bucketsToWrite, nil)
 }

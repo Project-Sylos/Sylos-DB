@@ -55,6 +55,7 @@ func (db *DB) GetMaxKnownDepth(queueType string) int {
 // Status constants for both traversal and copy phases
 const (
 	StatusPending    = "pending"
+	StatusInProgress = "in-progress" // Task is currently being processed by a worker
 	StatusSuccessful = "successful"
 	StatusFailed     = "failed"
 	StatusNotOnSrc   = "not_on_src" // Only for dst nodes during traversal
@@ -184,7 +185,7 @@ func EnsureLevelBucket(tx *bolt.Tx, queueType string, level int) error {
 	}
 
 	// Create status sub-buckets
-	statuses := []string{StatusPending, StatusSuccessful, StatusFailed, StatusExcluded}
+	statuses := []string{StatusPending, StatusInProgress, StatusSuccessful, StatusFailed, StatusExcluded}
 	if queueType == BucketDst {
 		statuses = append(statuses, StatusNotOnSrc)
 	}

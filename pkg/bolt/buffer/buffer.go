@@ -286,7 +286,7 @@ func (b *Buffer) Stop() error {
 		select {
 		case <-done:
 			// Flush loop completed successfully
-		case <-time.After(2 * time.Second):
+		case <-time.After(b.flushInterval):
 			// Timeout - flush loop may be stuck or slow
 			// Continue anyway to prevent blocking the entire shutdown
 		}

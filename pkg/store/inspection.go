@@ -52,8 +52,6 @@ const (
 // InspectQueue generates a QueueReport for a single queue (SRC or DST).
 // mode determines whether to use stats-based (fast) or scan-based (accurate) counting.
 func (s *Store) InspectQueue(queueType string, mode InspectionMode) (*QueueReport, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
 	report := &QueueReport{
 		QueueType: queueType,
@@ -62,15 +60,21 @@ func (s *Store) InspectQueue(queueType string, mode InspectionMode) (*QueueRepor
 	// Count total nodes
 	var totalNodes int
 	var err error
+	topic := getTopicForQueueType(queueType)
+	bucketsToRead := [][]string{
+		{"Traversal-Data", "STATS"}, // Stats bucket
+		bolt.GetNodesBucketPath(queueType),
+	}
+
 	if mode == InspectionModeScan {
 		// Flush buffer to ensure accurate scan
-		if err := s.checkDomainConflict(DomainDependency{Stats: true}); err != nil {
+		if err := s.checkConflict(topic, bucketsToRead); err != nil {
 			return nil, err
 		}
 		totalNodes, err = s.db.CountNodes(queueType)
 	} else {
 		// Stats-based: use GetBucketCount (O(1))
-		if err := s.checkDomainConflict(DomainDependency{Stats: true}); err != nil {
+		if err := s.checkConflict(topic, bucketsToRead); err != nil {
 			return nil, err
 		}
 		count, err := s.db.GetBucketCount(bolt.GetNodesBucketPath(queueType))
@@ -201,11 +205,13 @@ func (s *Store) InspectDatabase(mode InspectionMode) (*DatabaseReport, error) {
 // GetMinPendingLevel finds the minimum level that has pending items for a queue.
 // Returns -1 if no pending items exist.
 func (s *Store) GetMinPendingLevel(queueType string) (int, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	topic := getTopicForQueueType(queueType)
 
-	// Check conflicts and flush if needed
-	if err := s.checkDomainConflict(DomainDependency{Stats: true}); err != nil {
+	// Check conflicts: reads from stats bucket
+	bucketsToRead := [][]string{
+		{"Traversal-Data", "STATS"}, // Stats bucket
+	}
+	if err := s.checkConflict(topic, bucketsToRead); err != nil {
 		return -1, err
 	}
 

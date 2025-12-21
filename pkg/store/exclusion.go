@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	"github.com/Project-Sylos/Sylos-DB/pkg/bolt"
+	bbolt "go.etcd.io/bbolt"
 )
 
 // MarkExcluded marks a node as excluded (either explicitly or inherited).
@@ -16,21 +17,23 @@ func (s *Store) MarkExcluded(queueType string, nodeID string, inherited bool) er
 		return fmt.Errorf("node ID cannot be empty")
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	topic := getTopicForQueueType(queueType)
 
-	// Check conflicts before reading node state (all levels since we don't know which level)
-	qr := QueueRound{QueueType: queueType, Level: -1}
-	if err := s.checkDomainConflict(DomainDependency{
-		Nodes: []QueueRound{qr},
-	}); err != nil {
+	// Check conflicts: reads from nodes bucket
+	bucketsToRead := [][]string{
+		bolt.GetNodesBucketPath(queueType),
+	}
+	if err := s.checkConflict(topic, bucketsToRead); err != nil {
 		return err
 	}
 
-	// Queue the write operation
-	return s.queueWrite(func(db *bolt.DB) error {
+	// Queue the write operation: writes to nodes bucket
+	bucketsToWrite := [][]string{
+		bolt.GetNodesBucketPath(queueType),
+	}
+	return s.queueWrite(topic, func(tx *bbolt.Tx) error {
 		// Get current node state
-		state, err := bolt.GetNodeState(db, queueType, nodeID)
+		state, err := bolt.GetNodeStateInTx(tx, queueType, nodeID)
 		if err != nil {
 			return fmt.Errorf("failed to get node state: %w", err)
 		}
@@ -43,33 +46,31 @@ func (s *Store) MarkExcluded(queueType string, nodeID string, inherited bool) er
 		}
 
 		// Write back to database
-		return bolt.SetNodeState(db, queueType, []byte(nodeID), state)
-	}, DomainImpact{
-		Nodes:     []QueueRound{qr},
-		Exclusion: true,
-	})
+		return bolt.SetNodeStateInTx(tx, queueType, []byte(nodeID), state)
+	}, bucketsToWrite, nil)
 }
 
 // SweepInheritedExclusions performs an exclusion sweep at a specific level.
 // This scans the exclusion holding bucket and updates affected nodes.
 func (s *Store) SweepInheritedExclusions(queueType string, level int) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	topic := getTopicForQueueType(queueType)
 
-	qr := QueueRound{QueueType: queueType, Level: level}
-
-	// Check conflicts before sweep
-	if err := s.checkDomainConflict(DomainDependency{
-		Nodes:     []QueueRound{qr},
-		Exclusion: true,
-	}); err != nil {
+	// Check conflicts: reads from exclusion holding bucket and nodes bucket
+	bucketsToRead := [][]string{
+		bolt.GetExclusionHoldingBucketPath(queueType),
+		bolt.GetNodesBucketPath(queueType),
+	}
+	if err := s.checkConflict(topic, bucketsToRead); err != nil {
 		return err
 	}
 
-	// Queue the write operation
-	return s.queueWrite(func(db *bolt.DB) error {
+	// Queue the write operation: writes to nodes bucket
+	bucketsToWrite := [][]string{
+		bolt.GetNodesBucketPath(queueType),
+	}
+	return s.queueWrite(topic, func(tx *bbolt.Tx) error {
 		// Scan exclusion holding bucket (limit 0 = no limit)
-		entries, hasMore, err := bolt.ScanExclusionHoldingBucketByLevel(db, queueType, level, 0)
+		entries, hasMore, err := bolt.ScanExclusionHoldingBucketByLevelInTx(tx, queueType, level, 0)
 		if err != nil {
 			return fmt.Errorf("failed to scan exclusion holding bucket: %w", err)
 		}
@@ -77,23 +78,20 @@ func (s *Store) SweepInheritedExclusions(queueType string, level int) error {
 
 		// Update each affected node
 		for _, entry := range entries {
-			state, err := bolt.GetNodeState(db, queueType, entry.NodeID)
+			state, err := bolt.GetNodeStateInTx(tx, queueType, entry.NodeID)
 			if err != nil {
 				continue // Skip nodes that don't exist
 			}
 
 			state.InheritedExcluded = true
 
-			if err := bolt.SetNodeState(db, queueType, []byte(entry.NodeID), state); err != nil {
+			if err := bolt.SetNodeStateInTx(tx, queueType, []byte(entry.NodeID), state); err != nil {
 				return fmt.Errorf("failed to update node %s: %w", entry.NodeID, err)
 			}
 		}
 
 		return nil
-	}, DomainImpact{
-		Nodes:     []QueueRound{qr},
-		Exclusion: true,
-	})
+	}, bucketsToWrite, nil)
 }
 
 // CheckExclusionStatus checks if a node is excluded and whether it's inherited.
@@ -102,14 +100,13 @@ func (s *Store) CheckExclusionStatus(queueType string, nodeID string) (excluded 
 		return false, false, fmt.Errorf("node ID cannot be empty")
 	}
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	topic := getTopicForQueueType(queueType)
 
-	// Check conflicts before reading
-	qr := QueueRound{QueueType: queueType, Level: -1}
-	if err := s.checkDomainConflict(DomainDependency{
-		Nodes: []QueueRound{qr},
-	}); err != nil {
+	// Check conflicts: reads from nodes bucket
+	bucketsToRead := [][]string{
+		bolt.GetNodesBucketPath(queueType),
+	}
+	if err := s.checkConflict(topic, bucketsToRead); err != nil {
 		return false, false, err
 	}
 
@@ -127,13 +124,13 @@ func (s *Store) CheckExclusionStatus(queueType string, nodeID string) (excluded 
 // ScanExclusionHoldingAtLevel scans the exclusion holding bucket at a specific level.
 // Returns entries and whether there are more entries beyond the limit.
 func (s *Store) ScanExclusionHoldingAtLevel(queueType string, level int, limit int) ([]bolt.ExclusionEntry, bool, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	topic := getTopicForQueueType(queueType)
 
-	// Check conflicts before reading
-	if err := s.checkDomainConflict(DomainDependency{
-		Exclusion: true,
-	}); err != nil {
+	// Check conflicts: reads from exclusion holding bucket
+	bucketsToRead := [][]string{
+		bolt.GetExclusionHoldingBucketPath(queueType),
+	}
+	if err := s.checkConflict(topic, bucketsToRead); err != nil {
 		return nil, false, err
 	}
 
@@ -146,13 +143,14 @@ func (s *Store) CheckHoldingEntry(queueType string, nodeID string) (exists bool,
 		return false, "", fmt.Errorf("node ID cannot be empty")
 	}
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	topic := getTopicForQueueType(queueType)
 
-	// Check conflicts before reading
-	if err := s.checkDomainConflict(DomainDependency{
-		Exclusion: true,
-	}); err != nil {
+	// Check conflicts: reads from exclusion holding buckets
+	bucketsToRead := [][]string{
+		bolt.GetExclusionHoldingBucketPath(queueType),
+		bolt.GetUnexclusionHoldingBucketPath(queueType),
+	}
+	if err := s.checkConflict(topic, bucketsToRead); err != nil {
 		return false, "", err
 	}
 
@@ -165,12 +163,21 @@ func (s *Store) AddHoldingEntry(queueType string, nodeID string, depth int, mode
 		return fmt.Errorf("node ID cannot be empty")
 	}
 
+	topic := getTopicForQueueType(queueType)
+
+	// Determine which holding bucket to write to
+	var bucketPath []string
+	if mode == "exclude" {
+		bucketPath = bolt.GetExclusionHoldingBucketPath(queueType)
+	} else {
+		bucketPath = bolt.GetUnexclusionHoldingBucketPath(queueType)
+	}
+
 	// Queue the write operation
-	return s.queueWrite(func(db *bolt.DB) error {
-		return bolt.AddHoldingEntry(db, queueType, nodeID, depth, mode)
-	}, DomainImpact{
-		Exclusion: true,
-	})
+	bucketsToWrite := [][]string{bucketPath}
+	return s.queueWrite(topic, func(tx *bbolt.Tx) error {
+		return bolt.AddHoldingEntryInTx(tx, queueType, nodeID, depth, mode)
+	}, bucketsToWrite, nil)
 }
 
 // RemoveHoldingEntry removes a node from the exclusion holding bucket.
@@ -179,10 +186,19 @@ func (s *Store) RemoveHoldingEntry(queueType string, nodeID string, mode string)
 		return fmt.Errorf("node ID cannot be empty")
 	}
 
+	topic := getTopicForQueueType(queueType)
+
+	// Determine which holding bucket to remove from
+	var bucketPath []string
+	if mode == "exclude" {
+		bucketPath = bolt.GetExclusionHoldingBucketPath(queueType)
+	} else {
+		bucketPath = bolt.GetUnexclusionHoldingBucketPath(queueType)
+	}
+
 	// Queue the write operation
-	return s.queueWrite(func(db *bolt.DB) error {
-		return bolt.RemoveHoldingEntry(db, queueType, nodeID, mode)
-	}, DomainImpact{
-		Exclusion: true,
-	})
+	bucketsToWrite := [][]string{bucketPath}
+	return s.queueWrite(topic, func(tx *bbolt.Tx) error {
+		return bolt.RemoveHoldingEntryInTx(tx, queueType, nodeID, mode)
+	}, bucketsToWrite, nil)
 }

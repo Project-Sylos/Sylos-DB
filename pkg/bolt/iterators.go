@@ -277,21 +277,90 @@ func (db *DB) FindMinPendingLevel(queueType string) (int, error) {
 	return minLevel, nil
 }
 
-// LeaseTasksFromStatus retrieves up to limit ULIDs from a status bucket.
-// This is used for worker task leasing.
-func (db *DB) LeaseTasksFromStatus(queueType string, level int, status string, limit int) ([][]byte, error) {
+// LeaseTasksFromStatus atomically leases tasks by moving them from the source status
+// to "in-progress" status. This prevents race conditions where multiple workers
+// could lease the same task. Similar to MongoDB's findAndModify operation.
+//
+// This function:
+// 1. Finds up to limit tasks in the source status
+// 2. Atomically moves each from source status -> "in-progress"
+// 3. Returns the leased node IDs
+//
+// If sourceStatus is already "in-progress", this will just return tasks that are
+// already in-progress (useful for recovery scenarios).
+func (db *DB) LeaseTasksFromStatus(queueType string, level int, sourceStatus string, limit int) ([][]byte, error) {
 	var nodeIDs [][]byte
 
-	err := db.View(func(tx *bolt.Tx) error {
-		bucket := getBucket(tx, GetStatusBucketPath(queueType, level, status))
-		if bucket == nil {
-			return nil // No items in this status
+	// Use Update (write transaction) to atomically move tasks
+	err := db.Update(func(tx *bolt.Tx) error {
+		sourceBucket := getBucket(tx, GetStatusBucketPath(queueType, level, sourceStatus))
+		if sourceBucket == nil {
+			return nil // No items in source status
 		}
 
-		cursor := bucket.Cursor()
+		// Get or create in-progress bucket
+		inProgressBucket, err := GetOrCreateStatusBucket(tx, queueType, level, StatusInProgress)
+		if err != nil {
+			return fmt.Errorf("failed to get in-progress bucket: %w", err)
+		}
+
+		// Get status-lookup bucket for verification and updates
+		statusLookupBucket, err := GetOrCreateStatusLookupBucket(tx, queueType, level)
+		if err != nil {
+			return fmt.Errorf("failed to get status-lookup bucket: %w", err)
+		}
+
+		cursor := sourceBucket.Cursor()
 		count := 0
 
 		for k, _ := cursor.First(); k != nil && count < limit; k, _ = cursor.Next() {
+			// Verify via status-lookup that this task is still in source status
+			// This prevents leasing tasks that have been transitioned but not yet flushed
+			currentStatusBytes := statusLookupBucket.Get(k)
+			if currentStatusBytes == nil {
+				// No status-lookup entry - this shouldn't happen, but skip to be safe
+				continue
+			}
+
+			currentStatus := string(currentStatusBytes)
+			if currentStatus != sourceStatus {
+				// Status has changed - skip this task (it's been transitioned by another worker)
+				continue
+			}
+
+			// Atomically move from source status to in-progress
+			// 1. Delete from source status bucket
+			if err := sourceBucket.Delete(k); err != nil {
+				return fmt.Errorf("failed to delete from source status bucket: %w", err)
+			}
+
+			// 2. Add to in-progress bucket
+			if err := inProgressBucket.Put(k, []byte{}); err != nil {
+				return fmt.Errorf("failed to add to in-progress bucket: %w", err)
+			}
+
+			// 3. Update status-lookup to reflect in-progress status
+			if err := UpdateStatusLookup(tx, queueType, level, k, StatusInProgress); err != nil {
+				return fmt.Errorf("failed to update status-lookup: %w", err)
+			}
+
+			// 4. Update node's TraversalStatus in nodes bucket
+			nodesBucket := getBucket(tx, GetNodesBucketPath(queueType))
+			if nodesBucket != nil {
+				nodeData := nodesBucket.Get(k)
+				if nodeData != nil {
+					ns, err := DeserializeNodeState(nodeData)
+					if err == nil {
+						ns.TraversalStatus = StatusInProgress
+						updatedData, err := ns.Serialize()
+						if err == nil {
+							nodesBucket.Put(k, updatedData)
+						}
+					}
+				}
+			}
+
+			// Task successfully leased - add to return list
 			keyCopy := make([]byte, len(k))
 			copy(keyCopy, k)
 			nodeIDs = append(nodeIDs, keyCopy)

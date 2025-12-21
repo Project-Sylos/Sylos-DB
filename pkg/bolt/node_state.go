@@ -24,7 +24,7 @@ type NodeState struct {
 	MTime             string `json:"mtime"` // Last modified time
 	Depth             int    `json:"depth"`
 	CopyNeeded        bool   `json:"copy_needed"`        // Set during traversal if copy is required
-	TraversalStatus   string `json:"traversal_status"`   // "pending", "successful", "failed", "not_on_src"
+	TraversalStatus   string `json:"traversal_status"`   // "pending", "in-progress", "successful", "failed", "not_on_src"
 	CopyStatus        string `json:"copy_status"`        // "pending", "successful", "failed" (for future copy phase)
 	Status            string `json:"status,omitempty"`   // Legacy: Comparison status for dst nodes
 	ExplicitExcluded  bool   `json:"explicit_excluded"`  // Set by API, not modified by engine
