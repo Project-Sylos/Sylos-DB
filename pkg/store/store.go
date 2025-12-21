@@ -35,23 +35,54 @@ type Store struct {
 	mu     sync.RWMutex
 }
 
-// writeBuffer tracks pending write operations and which buckets they affect.
-type writeBuffer struct {
-	operations      []writeOp
-	affectedBuckets map[string]bool
-	mu              sync.Mutex
-	
-	// Buffer configuration
-	maxSize         int
-	flushInterval   time.Duration
-	ticker          *time.Ticker
-	stopChan        chan struct{}
+// QueueRound represents a (queueType, level) pair for domain tracking.
+type QueueRound struct {
+	QueueType string
+	Level     int
 }
 
-// writeOp represents a pending write operation.
+// DirtyDomains tracks which domain slices have unflushed writes.
+// This is O(1) metadata, not a scan of buffered operations.
+type DirtyDomains struct {
+	pendingByRound map[QueueRound]bool // Pending index affected
+	statusByRound  map[QueueRound]bool // Status indexes affected
+	nodesByRound   map[QueueRound]bool // Node data affected
+	lookups        bool                // Path-to-ULID, SRC↔DST mappings
+	stats          bool                // Stats bucket affected
+	logs           bool                // Log writes
+	exclusion      bool                // Exclusion status/holding buckets
+	queueStats     bool                // Queue observer metrics
+}
+
+// writeBuffer tracks pending write operations and affected domain slices.
+type writeBuffer struct {
+	operations   []writeOp
+	dirtyDomains DirtyDomains
+	mu           sync.Mutex
+
+	// Buffer configuration
+	maxSize       int
+	flushInterval time.Duration
+	ticker        *time.Ticker
+	stopChan      chan struct{}
+}
+
+// writeOp represents a pending write operation with its domain impact.
 type writeOp struct {
-	fn func(*bolt.DB) error
-	affectedBuckets []string
+	fn           func(*bolt.DB) error
+	domainImpact DomainImpact
+}
+
+// DomainImpact describes which domain slices a write operation affects.
+type DomainImpact struct {
+	Pending    []QueueRound
+	Status     []QueueRound
+	Nodes      []QueueRound
+	Lookups    bool
+	Stats      bool
+	Logs       bool
+	Exclusion  bool
+	QueueStats bool
 }
 
 // Open creates a new Store instance wrapping a bolt.DB.
@@ -64,11 +95,15 @@ func Open(dbPath string) (*Store, error) {
 	s := &Store{
 		db: db,
 		buffer: &writeBuffer{
-			operations:      make([]writeOp, 0, 1000),
-			affectedBuckets: make(map[string]bool),
-			maxSize:         1000,
-			flushInterval:   2 * time.Second,
-			stopChan:        make(chan struct{}),
+			operations: make([]writeOp, 0, 1000),
+			dirtyDomains: DirtyDomains{
+				pendingByRound: make(map[QueueRound]bool),
+				statusByRound:  make(map[QueueRound]bool),
+				nodesByRound:   make(map[QueueRound]bool),
+			},
+			maxSize:       1000,
+			flushInterval: 2 * time.Second,
+			stopChan:      make(chan struct{}),
 		},
 	}
 
@@ -130,25 +165,61 @@ func (s *Store) flushBuffer() error {
 		}
 	}
 
-	// Clear buffer
+	// Clear buffer and dirty domains
 	s.buffer.operations = s.buffer.operations[:0]
-	s.buffer.affectedBuckets = make(map[string]bool)
+	s.buffer.dirtyDomains = DirtyDomains{
+		pendingByRound: make(map[QueueRound]bool),
+		statusByRound:  make(map[QueueRound]bool),
+		nodesByRound:   make(map[QueueRound]bool),
+	}
 
 	return nil
 }
 
-// checkConflict checks if a read would conflict with buffered writes.
+// checkDomainConflict checks if a read would conflict with buffered writes in specific domain slices.
 // If conflict detected, flushes buffer before returning.
 // Caller must hold s.mu lock.
-func (s *Store) checkConflict(readBuckets ...string) error {
+func (s *Store) checkDomainConflict(deps DomainDependency) error {
 	s.buffer.mu.Lock()
 	hasConflict := false
-	for _, bucket := range readBuckets {
-		if s.buffer.affectedBuckets[bucket] {
+
+	// Check pending index conflicts
+	for _, qr := range deps.Pending {
+		if s.buffer.dirtyDomains.pendingByRound[qr] {
 			hasConflict = true
 			break
 		}
 	}
+
+	// Check status index conflicts
+	if !hasConflict {
+		for _, qr := range deps.Status {
+			if s.buffer.dirtyDomains.statusByRound[qr] {
+				hasConflict = true
+				break
+			}
+		}
+	}
+
+	// Check node data conflicts
+	if !hasConflict {
+		for _, qr := range deps.Nodes {
+			if s.buffer.dirtyDomains.nodesByRound[qr] {
+				hasConflict = true
+				break
+			}
+		}
+	}
+
+	// Check global domain conflicts
+	if !hasConflict {
+		hasConflict = (deps.Lookups && s.buffer.dirtyDomains.lookups) ||
+			(deps.Stats && s.buffer.dirtyDomains.stats) ||
+			(deps.Logs && s.buffer.dirtyDomains.logs) ||
+			(deps.Exclusion && s.buffer.dirtyDomains.exclusion) ||
+			(deps.QueueStats && s.buffer.dirtyDomains.queueStats)
+	}
+
 	s.buffer.mu.Unlock()
 
 	if hasConflict {
@@ -158,20 +229,53 @@ func (s *Store) checkConflict(readBuckets ...string) error {
 	return nil
 }
 
-// queueWrite adds a write operation to the buffer.
-func (s *Store) queueWrite(fn func(*bolt.DB) error, affectedBuckets ...string) error {
+// DomainDependency describes which domain slices a read operation depends on.
+type DomainDependency struct {
+	Pending    []QueueRound
+	Status     []QueueRound
+	Nodes      []QueueRound
+	Lookups    bool
+	Stats      bool
+	Logs       bool
+	Exclusion  bool
+	QueueStats bool
+}
+
+// queueWrite adds a write operation to the buffer with its domain impact.
+func (s *Store) queueWrite(fn func(*bolt.DB) error, impact DomainImpact) error {
 	s.buffer.mu.Lock()
 	defer s.buffer.mu.Unlock()
 
 	// Add operation to buffer
 	s.buffer.operations = append(s.buffer.operations, writeOp{
-		fn:              fn,
-		affectedBuckets: affectedBuckets,
+		fn:           fn,
+		domainImpact: impact,
 	})
 
-	// Track affected buckets
-	for _, bucket := range affectedBuckets {
-		s.buffer.affectedBuckets[bucket] = true
+	// Mark affected domain slices as dirty
+	for _, qr := range impact.Pending {
+		s.buffer.dirtyDomains.pendingByRound[qr] = true
+	}
+	for _, qr := range impact.Status {
+		s.buffer.dirtyDomains.statusByRound[qr] = true
+	}
+	for _, qr := range impact.Nodes {
+		s.buffer.dirtyDomains.nodesByRound[qr] = true
+	}
+	if impact.Lookups {
+		s.buffer.dirtyDomains.lookups = true
+	}
+	if impact.Stats {
+		s.buffer.dirtyDomains.stats = true
+	}
+	if impact.Logs {
+		s.buffer.dirtyDomains.logs = true
+	}
+	if impact.Exclusion {
+		s.buffer.dirtyDomains.exclusion = true
+	}
+	if impact.QueueStats {
+		s.buffer.dirtyDomains.queueStats = true
 	}
 
 	// Flush if buffer is full
@@ -200,4 +304,3 @@ func (wb *writeBuffer) flushLoop(s *Store) {
 		}
 	}
 }
-

@@ -14,7 +14,9 @@ func (s *Store) GetLevelProgress(queueType string, level int) (pending, complete
 	defer s.mu.RUnlock()
 
 	// Check conflicts and flush if needed
-	if err := s.checkConflict("stats"); err != nil {
+	if err := s.checkDomainConflict(DomainDependency{
+		Stats: true, // Depends on stats bucket
+	}); err != nil {
 		return 0, 0, 0, err
 	}
 
@@ -43,7 +45,9 @@ func (s *Store) GetQueueDepth(queueType string) (int, error) {
 	defer s.mu.RUnlock()
 
 	// Check conflicts and flush if needed
-	if err := s.checkConflict("stats"); err != nil {
+	if err := s.checkDomainConflict(DomainDependency{
+		Stats: true, // Depends on stats bucket
+	}); err != nil {
 		return 0, err
 	}
 
@@ -73,7 +77,9 @@ func (s *Store) CountStatusAtLevel(queueType string, level int, status string) (
 	defer s.mu.RUnlock()
 
 	// Check conflicts and flush if needed
-	if err := s.checkConflict("stats"); err != nil {
+	if err := s.checkDomainConflict(DomainDependency{
+		Stats: true, // Depends on stats bucket
+	}); err != nil {
 		return 0, err
 	}
 
@@ -87,9 +93,66 @@ func (s *Store) CountNodes(queueType string) (int, error) {
 	defer s.mu.RUnlock()
 
 	// Check conflicts and flush if needed
-	if err := s.checkConflict("stats"); err != nil {
+	if err := s.checkDomainConflict(DomainDependency{
+		Stats: true, // Depends on stats bucket (node counts are stored there)
+	}); err != nil {
 		return 0, err
 	}
 
 	return s.db.CountNodes(queueType)
+}
+
+// SetQueueStats writes queue statistics to the queue-stats bucket.
+// queueKey is the key for the stats (e.g., "src-traversal", "dst-traversal").
+// statsJSON is the JSON-encoded stats data to store.
+func (s *Store) SetQueueStats(queueKey string, statsJSON []byte) error {
+	// Queue the write operation with domain impact
+	return s.queueWrite(func(db *bolt.DB) error {
+		return db.SetQueueStats(queueKey, statsJSON)
+	}, DomainImpact{
+		QueueStats: true, // Affects queue observer stats
+	})
+}
+
+// SetQueueStatsBatch writes multiple queue statistics in a single transaction.
+// statsMap is a map of queue key -> JSON-encoded stats.
+// This is used by QueueObserver to publish metrics for multiple queues at once.
+func (s *Store) SetQueueStatsBatch(statsMap map[string][]byte) error {
+	// Queue the write operation with domain impact
+	return s.queueWrite(func(db *bolt.DB) error {
+		return db.SetQueueStatsBatch(statsMap)
+	}, DomainImpact{
+		QueueStats: true, // Affects queue observer stats
+	})
+}
+
+// GetQueueStats retrieves queue statistics from the queue-stats bucket.
+// Returns the JSON-encoded stats for the specified queue key (e.g., "src-traversal", "dst-traversal").
+// Returns nil if the stats don't exist.
+//
+// NOTE: Queue stats are eventually consistent - this method does NOT flush the buffer.
+// Queue stats are used for API polling (200ms interval) and don't require immediate consistency.
+func (s *Store) GetQueueStats(queueKey string) ([]byte, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// Queue stats are eventually consistent - no conflict check needed
+	// API polling can tolerate slight delays (buffer flushes every 2 seconds by default)
+
+	return s.db.GetQueueStats(queueKey)
+}
+
+// GetAllQueueStats retrieves all queue statistics from the queue-stats bucket.
+// Returns a map of queue key -> JSON-encoded stats.
+//
+// NOTE: Queue stats are eventually consistent - this method does NOT flush the buffer.
+// Queue stats are used for API polling (200ms interval) and don't require immediate consistency.
+func (s *Store) GetAllQueueStats() (map[string][]byte, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// Queue stats are eventually consistent - no conflict check needed
+	// API polling can tolerate slight delays (buffer flushes every 2 seconds by default)
+
+	return s.db.GetAllQueueStats()
 }

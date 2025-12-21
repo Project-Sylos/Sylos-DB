@@ -225,7 +225,66 @@ count, err := s.CountStatusAtLevel("SRC", level, bolt.StatusNotOnSrc)
 
 // Count total nodes in queue
 totalNodes, err := s.CountNodes("SRC")
+
+// Queue observer metrics (for QueueObserver)
+statsMap := map[string][]byte{
+    "src-traversal": metricsJSON,
+    "dst-traversal": metricsJSON2,
+}
+err := s.SetQueueStatsBatch(statsMap)
+
+// Or single queue
+err := s.SetQueueStats("src-traversal", metricsJSON)
+
+// Read queue stats
+statsJSON, err := s.GetQueueStats("src-traversal")
+allStats, err := s.GetAllQueueStats()
 ```
+
+### Inspection & Reporting
+
+```go
+// Generate fast stats-based report (O(1))
+report, err := s.InspectQueue("SRC", store.InspectionModeStats)
+
+// Generate accurate scan-based report (O(n))
+report, err := s.InspectQueue("SRC", store.InspectionModeScan)
+
+// Inspect entire database
+dbReport, err := s.InspectDatabase(store.InspectionModeStats)
+fmt.Printf("SRC Total Nodes: %d\n", dbReport.Src.TotalNodes)
+fmt.Printf("DST Total Nodes: %d\n", dbReport.Dst.TotalNodes)
+
+// Check completion status
+isComplete, err := s.IsQueueComplete("SRC")
+isMigrationComplete, err := s.IsMigrationComplete()
+
+// Find minimum pending level
+minLevel, err := s.GetMinPendingLevel("SRC") // -1 if no pending
+```
+
+### Test Utilities
+
+```go
+// Count nodes in a subtree (test only)
+stats, err := s.CountSubtree("SRC", "/path/to/root")
+fmt.Printf("Total: %d, Folders: %d, Files: %d, MaxDepth: %d\n",
+    stats.TotalNodes, stats.TotalFolders, stats.TotalFiles, stats.MaxDepth)
+
+// Delete entire subtree (test only - does NOT delete root)
+err := s.DeleteSubtree("SRC", "/path/to/root")
+
+// Set exclusion flag on node (test only)
+node, err := s.GetNodeByPath("SRC", "/path/to/node")
+err = s.SetNodeExclusionFlag("SRC", node.ID, true)  // Mark as excluded
+err = s.SetNodeExclusionFlag("SRC", node.ID, false) // Mark as unexcluded
+
+// Count excluded nodes (test only)
+totalExcluded, err := s.CountExcludedNodes("SRC")
+excludedInSubtree, err := s.CountExcludedInSubtree("SRC", "/path/to/root")
+```
+
+**Note**: These are test-focused operations with O(n) performance characteristics. Do not use in production code.
 
 ### Logging
 
@@ -308,9 +367,10 @@ hasPending, err := s.HasPendingAtLevel("SRC", level)
 ## Performance Characteristics
 
 - **Buffering**: Writes are buffered internally (default: 1000 entries or 2 seconds)
-- **Auto-Flush**: Triggered by read conflicts, size threshold, or time threshold
+- **Auto-Flush**: Triggered by read conflicts (operational data only), size threshold, or time threshold
 - **Barriers**: Explicit consistency checkpoints at coordination points
 - **O(1) Stats**: Status checks use pre-computed stats bucket (fast)
+- **Eventually Consistent Reads**: Log and queue stats queries never trigger flush (optimized for high-frequency polling)
 
 ## Complete API Reference
 
@@ -344,13 +404,52 @@ hasPending, err := s.HasPendingAtLevel("SRC", level)
 - `GetQueueDepth(queueType) (int, error)`
 - `CountStatusAtLevel(queueType, level, status) (int, error)` - Count nodes at level with specific status
 - `CountNodes(queueType) (int, error)` - Count total nodes in queue
+- `SetQueueStats(queueKey, statsJSON) error` - Write queue observer metrics (single)
+- `SetQueueStatsBatch(statsMap) error` - Write queue observer metrics (batch)
+- `GetQueueStats(queueKey) ([]byte, error)` - Read queue observer metrics - **Eventually consistent** (no flush)
+- `GetAllQueueStats() (map[string][]byte, error)` - Read all queue observer metrics - **Eventually consistent** (no flush)
+
+### Inspection & Reporting
+- `InspectQueue(queueType, mode) (*QueueReport, error)` - Generate complete inspection report for a queue
+- `InspectDatabase(mode) (*DatabaseReport, error)` - Generate complete inspection report for entire database
+- `GetMinPendingLevel(queueType) (int, error)` - Find minimum level with pending items (-1 if none)
+- `IsQueueComplete(queueType) (bool, error)` - Check if queue has no pending items
+- `IsMigrationComplete() (bool, error)` - Check if both SRC and DST queues are complete
+
+**Inspection Modes:**
+- `InspectionModeStats` - O(1) stats-based (fast, may be stale if stats outdated)
+- `InspectionModeScan` - O(n) bucket scans (accurate, counts actual bucket contents)
+
+**Report Types:**
+- `LevelStatus` - Status counts for a single level (Pending, Successful, Failed, NotOnSrc)
+- `QueueReport` - Complete report for a queue (SRC or DST) with level-by-level breakdown
+- `DatabaseReport` - Complete report for entire database (SRC and DST reports)
+
+### Lookups & Mappings
+
+- `GetBucketCount(bucketPath []string) (int, error)` - Get bucket count from stats (O(1))
+- `SetJoinMapping(srcID, dstID) error` - Create bidirectional SRC↔DST mapping
+- `GetJoinMapping(mappingType, sourceID) (string, error)` - Get join mapping ("src-to-dst" or "dst-to-src")
+- `SetPathMapping(queueType, path, nodeID) error` - Create path→ULID mapping (hashed)
+
+### Test Utilities
+
+These methods support test infrastructure and should not be used in production code:
+
+- `CountSubtree(queueType, rootPath) (SubtreeStats, error)` - DFS count of nodes/folders/files in subtree
+- `DeleteSubtree(queueType, rootPath) error` - Delete all nodes in subtree (except root)
+- `SetNodeExclusionFlag(queueType, nodeID, explicitExcluded) error` - Set exclusion flag on node
+- `CountExcludedNodes(queueType) (int, error)` - Count all excluded nodes in queue
+- `CountExcludedInSubtree(queueType, rootPath) (int, error)` - Count excluded nodes in subtree
+
+**Note**: These are test-focused operations with O(n) performance characteristics unsuitable for production.
 
 ### Coordination
 - `Barrier(reason BarrierReason) error`
 
 ### Logging
 - `RecordLog(level, entity, entityID, message) error`
-- `QueryLogs(level, limit) ([]*bolt.LogEntry, error)`
+- `QueryLogs(level, limit) ([]*bolt.LogEntry, error)` - **Eventually consistent** (no flush on read)
 
 ### Lifecycle
 - `Open(dbPath) (*Store, error)`

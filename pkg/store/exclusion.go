@@ -19,8 +19,11 @@ func (s *Store) MarkExcluded(queueType string, nodeID string, inherited bool) er
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Check conflicts before reading node state
-	if err := s.checkConflict("nodes"); err != nil {
+	// Check conflicts before reading node state (all levels since we don't know which level)
+	qr := QueueRound{QueueType: queueType, Level: -1}
+	if err := s.checkDomainConflict(DomainDependency{
+		Nodes: []QueueRound{qr},
+	}); err != nil {
 		return err
 	}
 
@@ -41,7 +44,10 @@ func (s *Store) MarkExcluded(queueType string, nodeID string, inherited bool) er
 
 		// Write back to database
 		return bolt.SetNodeState(db, queueType, []byte(nodeID), state)
-	}, "nodes")
+	}, DomainImpact{
+		Nodes:     []QueueRound{qr},
+		Exclusion: true,
+	})
 }
 
 // SweepInheritedExclusions performs an exclusion sweep at a specific level.
@@ -50,8 +56,13 @@ func (s *Store) SweepInheritedExclusions(queueType string, level int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	qr := QueueRound{QueueType: queueType, Level: level}
+
 	// Check conflicts before sweep
-	if err := s.checkConflict("nodes", "exclusion-holding"); err != nil {
+	if err := s.checkDomainConflict(DomainDependency{
+		Nodes:     []QueueRound{qr},
+		Exclusion: true,
+	}); err != nil {
 		return err
 	}
 
@@ -79,7 +90,10 @@ func (s *Store) SweepInheritedExclusions(queueType string, level int) error {
 		}
 
 		return nil
-	}, "nodes", "exclusion-holding")
+	}, DomainImpact{
+		Nodes:     []QueueRound{qr},
+		Exclusion: true,
+	})
 }
 
 // CheckExclusionStatus checks if a node is excluded and whether it's inherited.
@@ -91,40 +105,43 @@ func (s *Store) CheckExclusionStatus(queueType string, nodeID string) (excluded 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	// Check conflicts and flush if needed
-	if err := s.checkConflict("nodes"); err != nil {
+	// Check conflicts before reading
+	qr := QueueRound{QueueType: queueType, Level: -1}
+	if err := s.checkDomainConflict(DomainDependency{
+		Nodes: []QueueRound{qr},
+	}); err != nil {
 		return false, false, err
 	}
 
-	// Get node state
 	state, err := bolt.GetNodeState(s.db, queueType, nodeID)
 	if err != nil {
 		return false, false, err
 	}
 
 	excluded = state.ExplicitExcluded || state.InheritedExcluded
-	inherited = state.InheritedExcluded
+	inherited = state.InheritedExcluded && !state.ExplicitExcluded
 
 	return excluded, inherited, nil
 }
 
-// ScanExclusionHoldingAtLevel scans the exclusion holding bucket for entries at a specific level.
-// Returns entries, a flag indicating if higher levels exist, and any error.
+// ScanExclusionHoldingAtLevel scans the exclusion holding bucket at a specific level.
+// Returns entries and whether there are more entries beyond the limit.
 func (s *Store) ScanExclusionHoldingAtLevel(queueType string, level int, limit int) ([]bolt.ExclusionEntry, bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	// Check conflicts and flush if needed
-	if err := s.checkConflict("exclusion-holding"); err != nil {
+	// Check conflicts before reading
+	if err := s.checkDomainConflict(DomainDependency{
+		Exclusion: true,
+	}); err != nil {
 		return nil, false, err
 	}
 
 	return bolt.ScanExclusionHoldingBucketByLevel(s.db, queueType, level, limit)
 }
 
-// CheckHoldingEntry checks if a node exists in either exclusion or unexclusion holding bucket.
-// Returns (exists, mode, error) where mode is "exclude", "unexclude", or "" if not found.
-func (s *Store) CheckHoldingEntry(queueType string, nodeID string) (bool, string, error) {
+// CheckHoldingEntry checks if a node has a holding entry and returns the mode.
+func (s *Store) CheckHoldingEntry(queueType string, nodeID string) (exists bool, mode string, err error) {
 	if nodeID == "" {
 		return false, "", fmt.Errorf("node ID cannot be empty")
 	}
@@ -132,42 +149,40 @@ func (s *Store) CheckHoldingEntry(queueType string, nodeID string) (bool, string
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	// Check conflicts and flush if needed
-	if err := s.checkConflict("exclusion-holding"); err != nil {
+	// Check conflicts before reading
+	if err := s.checkDomainConflict(DomainDependency{
+		Exclusion: true,
+	}); err != nil {
 		return false, "", err
 	}
 
 	return bolt.CheckHoldingEntry(s.db, queueType, nodeID)
 }
 
-// AddHoldingEntry adds a node to the exclusion or unexclusion holding bucket.
-// mode should be "exclude" or "unexclude".
+// AddHoldingEntry adds a node to the exclusion holding bucket.
 func (s *Store) AddHoldingEntry(queueType string, nodeID string, depth int, mode string) error {
 	if nodeID == "" {
 		return fmt.Errorf("node ID cannot be empty")
-	}
-	if mode != "exclude" && mode != "unexclude" {
-		return fmt.Errorf("mode must be 'exclude' or 'unexclude', got '%s'", mode)
 	}
 
 	// Queue the write operation
 	return s.queueWrite(func(db *bolt.DB) error {
 		return bolt.AddHoldingEntry(db, queueType, nodeID, depth, mode)
-	}, "exclusion-holding")
+	}, DomainImpact{
+		Exclusion: true,
+	})
 }
 
-// RemoveHoldingEntry removes a node from the exclusion or unexclusion holding bucket.
-// mode should be "exclude" or "unexclude".
+// RemoveHoldingEntry removes a node from the exclusion holding bucket.
 func (s *Store) RemoveHoldingEntry(queueType string, nodeID string, mode string) error {
 	if nodeID == "" {
 		return fmt.Errorf("node ID cannot be empty")
-	}
-	if mode != "exclude" && mode != "unexclude" {
-		return fmt.Errorf("mode must be 'exclude' or 'unexclude', got '%s'", mode)
 	}
 
 	// Queue the write operation
 	return s.queueWrite(func(db *bolt.DB) error {
 		return bolt.RemoveHoldingEntry(db, queueType, nodeID, mode)
-	}, "exclusion-holding")
+	}, DomainImpact{
+		Exclusion: true,
+	})
 }

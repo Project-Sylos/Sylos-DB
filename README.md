@@ -38,11 +38,13 @@ The Engine and API remain responsible for:
 
 ```
 Sylos-DB/
+├── docs/               # Detailed documentation (see docs/README.md)
 ├── pkg/
 │   ├── store/          # Domain-focused Store API (public)
 │   ├── bolt/           # BoltDB primitives and mechanics (internal)
 │   ├── duck/           # DuckDB support (future)
 │   └── utils/          # Shared utilities (ULID generation, etc.)
+└── README.md           # This file (repository overview)
 ```
 
 ### Package Structure
@@ -304,7 +306,19 @@ When migrating Engine/API code from direct Bolt usage:
 4. Replace explicit `Flush()` calls with semantic barriers
 5. Remove manual stats update calls (now automatic)
 
-See [`pkg/store/README.md`](pkg/store/README.md) for detailed API documentation.
+## Documentation
+
+This repository includes comprehensive documentation:
+
+- **[`docs/README.md`](docs/README.md)** - Documentation index and table of contents
+- **[`pkg/store/README.md`](pkg/store/README.md)** - Store API reference and usage guide
+- **[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)** - Authoritative Store + Buffer semantics spec
+- **[`docs/CONSISTENCY_MODELS.md`](docs/CONSISTENCY_MODELS.md)** - Domain-specific consistency models explained
+- **[`docs/DOMAIN_SEMANTICS_IMPLEMENTATION.md`](docs/DOMAIN_SEMANTICS_IMPLEMENTATION.md)** - Implementation details
+
+**Quick start**: Read this README for overview, then [`pkg/store/README.md`](pkg/store/README.md) for API usage.
+
+**Deep dive**: See [`docs/README.md`](docs/README.md) for a complete documentation guide.
 
 ## License
 

@@ -4,22 +4,18 @@
 package store
 
 import (
-	"fmt"
 	"time"
 
 	"github.com/Project-Sylos/Sylos-DB/pkg/bolt"
 	"github.com/Project-Sylos/Sylos-DB/pkg/utils"
-	bbolt "go.etcd.io/bbolt"
 )
 
 // RecordLog writes a log entry to the database.
-// Logs are buffered and flushed automatically.
+// level is the log level (e.g., "info", "error", "warning").
+// entity is the component/entity that produced the log (e.g., "traversal", "copy").
+// entityID is the specific instance ID if applicable.
+// message is the log message content.
 func (s *Store) RecordLog(level, entity, entityID, message string) error {
-	if level == "" || message == "" {
-		return fmt.Errorf("level and message cannot be empty")
-	}
-
-	// Create log entry
 	entry := bolt.LogEntry{
 		ID:        utils.GenerateULID(),
 		Timestamp: time.Now().Format(time.RFC3339Nano),
@@ -31,67 +27,31 @@ func (s *Store) RecordLog(level, entity, entityID, message string) error {
 
 	// Queue the write operation
 	return s.queueWrite(func(db *bolt.DB) error {
-		// Serialize log entry
-		data, err := bolt.SerializeLogEntry(entry)
-		if err != nil {
-			return fmt.Errorf("failed to serialize log entry: %w", err)
-		}
-
-		// Write to log level bucket
-		return db.Update(func(tx *bbolt.Tx) error {
-			levelBucket, err := bolt.GetOrCreateLogLevelBucket(tx, level)
-			if err != nil {
-				return fmt.Errorf("failed to get log level bucket: %w", err)
-			}
-
-			return levelBucket.Put([]byte(entry.ID), data)
-		})
-	}, "logs")
+		return bolt.InsertLogEntry(db, entry)
+	}, DomainImpact{
+		Logs: true,
+	})
 }
 
-// QueryLogs retrieves log entries matching the specified filters.
-// For now, this is a simple implementation that can be enhanced later.
+// QueryLogs retrieves log entries from the database.
+// level is the log level to filter by (e.g., "error", "warning", "" for all).
+// limit is the maximum number of entries to return (0 = no limit).
+// Returns logs in reverse chronological order (newest first).
+//
+// NOTE: Logs are eventually consistent - this method does NOT flush the buffer.
+// Log reads are used for UI polling (200ms interval) and don't require immediate consistency.
+// Logs are flushed at semantic barriers (e.g., shutdown, phase transitions) for durability.
 func (s *Store) QueryLogs(level string, limit int) ([]*bolt.LogEntry, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	// Check conflicts and flush if needed
-	if err := s.checkConflict("logs"); err != nil {
-		return nil, err
+	// Logs are eventually consistent - no conflict check needed
+	// UI polling can tolerate slight delays (buffer flushes every 2 seconds by default)
+
+	// Use bolt package methods for querying logs
+	if level != "" {
+		return bolt.GetLogsByLevel(s.db, level)
 	}
 
-	var logs []*bolt.LogEntry
-
-	// Query log level bucket
-	err := s.db.View(func(tx *bbolt.Tx) error {
-		levelBucket, err := bolt.GetOrCreateLogLevelBucket(tx, level)
-		if err != nil {
-			return err
-		}
-
-		cursor := levelBucket.Cursor()
-		count := 0
-
-		for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
-			if limit > 0 && count >= limit {
-				break
-			}
-
-			entry, err := bolt.DeserializeLogEntry(v)
-			if err != nil {
-				continue // Skip invalid entries
-			}
-
-			logs = append(logs, entry)
-			count++
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		return nil, err
-	}
-
-	return logs, nil
+	return bolt.GetAllLogs(s.db)
 }

@@ -9,9 +9,8 @@ import (
 	"github.com/Project-Sylos/Sylos-DB/pkg/bolt"
 )
 
-// GetNode retrieves a node by its ULID.
-// Automatically flushes buffer if there are pending writes to the nodes bucket.
-func (s *Store) GetNode(nodeID string) (*bolt.NodeState, error) {
+// GetNode retrieves a node's state by its ID.
+func (s *Store) GetNode(queueType string, nodeID string) (*bolt.NodeState, error) {
 	if nodeID == "" {
 		return nil, fmt.Errorf("node ID cannot be empty")
 	}
@@ -19,23 +18,20 @@ func (s *Store) GetNode(nodeID string) (*bolt.NodeState, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	// Check for conflicts and flush if needed
-	if err := s.checkConflict("nodes"); err != nil {
+	// Check conflicts (all levels since we don't know which level)
+	qr := QueueRound{QueueType: queueType, Level: -1}
+	if err := s.checkDomainConflict(DomainDependency{
+		Nodes: []QueueRound{qr},
+	}); err != nil {
 		return nil, err
 	}
 
-	// Try SRC first, then DST
-	node, err := bolt.GetNodeState(s.db, "SRC", nodeID)
-	if err == nil {
-		return node, nil
-	}
-
-	return bolt.GetNodeState(s.db, "DST", nodeID)
+	return bolt.GetNodeState(s.db, queueType, nodeID)
 }
 
-// GetNodeByPath retrieves a node by its path using the path-to-ULID lookup.
-// Automatically flushes buffer if there are pending writes to path-to-ulid or nodes buckets.
-func (s *Store) GetNodeByPath(queueType, path string) (*bolt.NodeState, error) {
+// GetNodeByPath retrieves a node's state by its filesystem path.
+// This uses the path-to-ULID lookup index.
+func (s *Store) GetNodeByPath(queueType string, path string) (*bolt.NodeState, error) {
 	if path == "" {
 		return nil, fmt.Errorf("path cannot be empty")
 	}
@@ -43,15 +39,19 @@ func (s *Store) GetNodeByPath(queueType, path string) (*bolt.NodeState, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	// Check for conflicts and flush if needed
-	if err := s.checkConflict("path-to-ulid", "nodes"); err != nil {
+	// Check conflicts for lookups and nodes
+	qr := QueueRound{QueueType: queueType, Level: -1}
+	if err := s.checkDomainConflict(DomainDependency{
+		Lookups: true,
+		Nodes:   []QueueRound{qr},
+	}); err != nil {
 		return nil, err
 	}
 
-	// Get ULID from path
+	// Look up ULID from path
 	nodeID, err := bolt.GetULIDFromPathOrHash(s.db, queueType, path)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get ULID from path: %w", err)
+		return nil, fmt.Errorf("failed to look up node ID: %w", err)
 	}
 	if nodeID == "" {
 		return nil, fmt.Errorf("node not found for path: %s", path)
@@ -61,9 +61,9 @@ func (s *Store) GetNodeByPath(queueType, path string) (*bolt.NodeState, error) {
 	return bolt.GetNodeState(s.db, queueType, nodeID)
 }
 
-// GetChildren retrieves the child node IDs for a given parent node.
-// Automatically flushes buffer if there are pending writes to the children bucket.
-func (s *Store) GetChildren(queueType, parentID string) ([]string, error) {
+// GetChildren retrieves child node information for a given parent node.
+// returnType can be "ids" (returns IDs only) or "states" (returns full NodeState objects).
+func (s *Store) GetChildren(queueType string, parentID string, returnType string) (interface{}, error) {
 	if parentID == "" {
 		return nil, fmt.Errorf("parent ID cannot be empty")
 	}
@@ -71,135 +71,147 @@ func (s *Store) GetChildren(queueType, parentID string) ([]string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	// Check for conflicts and flush if needed
-	if err := s.checkConflict("children"); err != nil {
+	// Check conflicts for lookups (children index) and nodes
+	qr := QueueRound{QueueType: queueType, Level: -1}
+	if err := s.checkDomainConflict(DomainDependency{
+		Lookups: true,
+		Nodes:   []QueueRound{qr},
+	}); err != nil {
 		return nil, err
 	}
 
-	// Get children IDs
-	result, err := bolt.GetChildrenByParentID(s.db, queueType, parentID, "ids")
-	if err != nil {
-		return nil, err
+	switch returnType {
+	case "ids":
+		return bolt.GetChildrenByParentID(s.db, queueType, parentID, "ids")
+	case "states":
+		return bolt.GetChildrenByParentID(s.db, queueType, parentID, "states")
+	default:
+		return nil, fmt.Errorf("invalid return type: %s (must be 'ids' or 'states')", returnType)
 	}
-
-	if childIDs, ok := result.([]string); ok {
-		return childIDs, nil
-	}
-
-	return nil, fmt.Errorf("unexpected result type from GetChildrenByParentID")
 }
 
-// ListPendingAtLevel retrieves pending nodes at a specific level.
-// Automatically flushes buffer if there are pending writes to status buckets.
-// Limit of 0 means no limit.
+// ListPendingAtLevel retrieves a list of pending nodes at a specific level.
+// Returns up to 'limit' nodes (0 = no limit).
 func (s *Store) ListPendingAtLevel(queueType string, level int, limit int) ([]*bolt.NodeState, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	// Check for conflicts and flush if needed
-	if err := s.checkConflict("status", "nodes"); err != nil {
+	qr := QueueRound{QueueType: queueType, Level: level}
+
+	// Check conflicts for pending index and nodes
+	if err := s.checkDomainConflict(DomainDependency{
+		Pending: []QueueRound{qr},
+		Nodes:   []QueueRound{qr},
+	}); err != nil {
 		return nil, err
 	}
 
-	// Iterate pending status bucket
-	var nodes []*bolt.NodeState
-	opts := bolt.IteratorOptions{Limit: limit}
+	var results []*bolt.NodeState
+
+	opts := bolt.IteratorOptions{
+		Limit: limit,
+	}
+
+	// Iterate over pending status bucket
 	err := s.db.IterateStatusBucket(queueType, level, bolt.StatusPending, opts, func(nodeID []byte) error {
-		// Get node state
+		// Get node state for each pending node
 		state, err := bolt.GetNodeState(s.db, queueType, string(nodeID))
 		if err != nil {
 			return err
 		}
-		nodes = append(nodes, state)
+		results = append(results, state)
 		return nil
 	})
 
-	if err != nil {
-		return nil, err
-	}
-
-	return nodes, nil
+	return results, err
 }
 
 // HasPendingAtLevel checks if there are any pending nodes at a specific level.
-// This is optimized for the common "is round complete?" check.
 func (s *Store) HasPendingAtLevel(queueType string, level int) (bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	// Check for conflicts and flush if needed
-	if err := s.checkConflict("status", "stats"); err != nil {
+	qr := QueueRound{QueueType: queueType, Level: level}
+
+	// Check conflicts for pending index and stats
+	if err := s.checkDomainConflict(DomainDependency{
+		Pending: []QueueRound{qr},
+		Stats:   true,
+	}); err != nil {
 		return false, err
 	}
 
-	// Use stats for O(1) check
-	count, err := s.db.GetBucketCount(bolt.GetStatusBucketPath(queueType, level, bolt.StatusPending))
-	if err != nil {
-		return false, err
-	}
-
-	return count > 0, nil
+	return s.db.HasStatusBucketItems(queueType, level, bolt.StatusPending)
 }
 
-// GetAllLevels returns all level numbers that exist for a queue type.
+// GetAllLevels returns all levels that exist for a queue type.
 func (s *Store) GetAllLevels(queueType string) ([]int, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	// Check conflicts and flush if needed
-	if err := s.checkConflict("levels"); err != nil {
+	// Check conflicts for nodes (conservative: all levels)
+	qr := QueueRound{QueueType: queueType, Level: -1}
+	if err := s.checkDomainConflict(DomainDependency{
+		Nodes: []QueueRound{qr},
+	}); err != nil {
 		return nil, err
 	}
 
 	return s.db.GetAllLevels(queueType)
 }
 
-// GetMaxKnownDepth scans the levels bucket and returns the highest level number found.
-// Returns -1 if no levels exist.
+// GetMaxKnownDepth returns the maximum level number that exists in the database.
 func (s *Store) GetMaxKnownDepth(queueType string) (int, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	// Check conflicts and flush if needed
-	if err := s.checkConflict("levels"); err != nil {
-		return -1, err
+	// Check conflicts for nodes (conservative: all levels)
+	qr := QueueRound{QueueType: queueType, Level: -1}
+	if err := s.checkDomainConflict(DomainDependency{
+		Nodes: []QueueRound{qr},
+	}); err != nil {
+		return 0, err
 	}
 
-	maxDepth := s.db.GetMaxKnownDepth(queueType)
-	return maxDepth, nil
-}
-
-// LeaseResult represents a leased task for worker processing.
-type LeaseResult struct {
-	Key   string // ULID for deduplication tracking
-	State *bolt.NodeState
-}
-
-// LeaseTasksAtLevel leases tasks (fetches nodes) from a status bucket at a specific level.
-// This is used for worker task leasing. Returns node IDs and states.
-func (s *Store) LeaseTasksAtLevel(queueType string, level int, status string, limit int) ([]LeaseResult, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	// Check conflicts and flush if needed (lease depends on status bucket)
-	if err := s.checkConflict("status", "nodes"); err != nil {
-		return nil, err
-	}
-
-	// Use the bolt package's BatchFetchWithKeys
-	results, err := bolt.BatchFetchWithKeys(s.db, queueType, level, status, limit)
+	levels, err := s.db.GetAllLevels(queueType)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 
-	// Convert FetchResult to LeaseResult
-	leaseResults := make([]LeaseResult, len(results))
-	for i, result := range results {
-		leaseResults[i] = LeaseResult{
-			Key:   result.Key,
-			State: result.State,
+	if len(levels) == 0 {
+		return 0, nil
+	}
+
+	maxLevel := levels[0]
+	for _, level := range levels {
+		if level > maxLevel {
+			maxLevel = level
 		}
 	}
 
-	return leaseResults, nil
+	return maxLevel, nil
+}
+
+// LeaseTasksAtLevel atomically leases pending tasks from a specific level for processing.
+// This is used for concurrent task processing with lease-based coordination.
+// limit specifies the maximum number of tasks to lease (0 = no limit).
+// Returns the leased node IDs.
+func (s *Store) LeaseTasksAtLevel(queueType string, level int, limit int) ([][]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	qr := QueueRound{QueueType: queueType, Level: level}
+
+	// Check conflicts for pending index and nodes
+	if err := s.checkDomainConflict(DomainDependency{
+		Pending: []QueueRound{qr},
+		Nodes:   []QueueRound{qr},
+		Status:  []QueueRound{qr},
+	}); err != nil {
+		return nil, err
+	}
+
+	// Execute lease operation synchronously (must flush first to ensure consistency)
+	// We don't queue this write because it needs to return the leased tasks immediately
+	return s.db.LeaseTasksFromStatus(queueType, level, bolt.StatusPending, limit)
 }
